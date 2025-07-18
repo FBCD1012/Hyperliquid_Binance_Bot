@@ -254,13 +254,9 @@ sdk.info.spot.getTokenDetails('').then(details => {
 
 - Get spot token details
 
-![截屏2025-07-19 01.49.31](/Users/dongqing/Library/Application Support/typora-user-images/截屏2025-07-19 01.49.31.png)
-
 ## Hyperliquid-Perp
 
 - **This is James Wayne's account**
-
-![截屏2025-07-17 04.52.06](/Users/dongqing/Library/Application Support/typora-user-images/截屏2025-07-17 04.52.06.png)
 
 - perp liquidation status
 
@@ -307,8 +303,6 @@ sdk.info.perpetuals.getFundingHistory('ATOM-PERP', eightHoursAgo, now).then(hist
     console.log('latest funding rate:', latest);
  });
 ```
-
-![截屏2025-07-17 05.11.13](/Users/dongqing/Library/Application Support/typora-user-images/截屏2025-07-19 01.54.00.png)
 
 - Predicted  fundingRate
 
