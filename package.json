@@ -1,0 +1,23 @@
+{
+  "name": "hyper_bn_trading_bot",
+  "version": "1.0.0",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "description": "",
+  "dependencies": {
+    "@binance/connector": "^3.6.1",
+    "binance-api-node": "^0.12.9",
+    "dotenv": "^17.2.0",
+    "https-proxy-agent": "^7.0.6",
+    "hyperliquid": "^1.7.6",
+    "node-telegram-bot-api": "^0.66.0",
+    "socks-proxy-agent": "^8.0.5",
+    "web3": "^4.16.0",
+    "ws": "^8.18.3"
+  }
+}
