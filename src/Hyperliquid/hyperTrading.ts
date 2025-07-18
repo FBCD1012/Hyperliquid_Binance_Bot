@@ -2,9 +2,9 @@
 const { Hyperliquid } = require('hyperliquid');
 const sdk = new Hyperliquid({
     enableWs: false,
-    privateKey: '0xd5c287f46747210fbe2af3320cd441f7991b8ee4e57887b37ff295b263c47b22',
+    privateKey: process.env.HL_PROVIDER_PRIVATE_KEY_0,
     testnet: true,
-    walletAddress: '0xAD5faB0778F2db54f6B78d45FFcFfef3381d09bF',
+    walletAddress: process.env.HL_PROVIDER_WALLET_0,
 });
 async function checkSupportedAssets() {
   try {
@@ -50,14 +50,14 @@ placeOrderExample();
 async function closePosition() {
   const sdk = new Hyperliquid({
     enableWs: false,
-    privateKey: '0xd5c287f46747210fbe2af3320cd441f7991b8ee4e57887b37ff295b263c47b22',
+    privateKey: process.env.HL_PROVIDER_PRIVATE_KEY_0,
     testnet: true,
-    walletAddress: '0x071b7Ec2C0a55ADc03E44A42Ee09A5066e3b7676',
+    walletAddress: process.env.REALL_WALLET,
   });
 
   try {
     // 1. 先查看当前持仓
-    const state = await sdk.info.perpetuals.getClearinghouseState('0x071b7Ec2C0a55ADc03E44A42Ee09A5066e3b7676');
+    const state = await sdk.info.perpetuals.getClearinghouseState(process.env.MY_WALLET);
     console.log('当前持仓:', state.assetPositions);
 
     // 2. 平掉 BTC-PERP 的全部持仓
@@ -65,7 +65,7 @@ async function closePosition() {
     console.log('平仓成功:', closeResponse);
 
     // 3. 再次查看持仓（确认已平仓）
-    const newState = await sdk.info.perpetuals.getClearinghouseState('0x071b7Ec2C0a55ADc03E44A42Ee09A5066e3b7676');
+    const newState = await sdk.info.perpetuals.getClearinghouseState(process.env.MY_WALLET);
     console.log('平仓后持仓:', newState.assetPositions);
 
   } catch (error) {
