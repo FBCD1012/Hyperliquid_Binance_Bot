@@ -3,7 +3,11 @@
   "version": "1.0.0",
   "main": "index.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "binance:info": "node src/Binance/bianceTradingStandard.js",
+    "binance:purchase": "node src/Binance/biancePurchase.js",
+    "binance:trading": "node src/Binance/bianceRealTrading.js",
+    "binance:trading-info": "node src/Binance/bianceTradingInfo.js"
   },
   "keywords": [],
   "author": "",
