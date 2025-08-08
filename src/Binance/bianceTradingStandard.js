@@ -1,7 +1,6 @@
 require('dotenv').config();
 const axios = require('axios');
 const { HttpsProxyAgent } = require('https-proxy-agent');
-
 // 全局代理配置
 const proxy = process.env.PROXY;
 let agent = null;
@@ -40,26 +39,17 @@ async function getContractTradingRules(symbol = 'BTCUSDT') {
         const contract = res.data.symbols.find(item => item.symbol === symbol);
         if (contract) {
             console.log('-----------------------------');
-            console.log('合约交易规则:');
-            console.log('交易对:', contract.symbol);
-            console.log('基础币种:', contract.baseAsset);
-            console.log('计价币种:', contract.quoteAsset);
+            // console.log('合约交易规则:');
+            // console.log('交易对:', contract.symbol);
+            // console.log('基础币种:', contract.baseAsset);
+            // console.log('计价币种:', contract.quoteAsset);
             console.log('合约上线时间:', new Date(contract.onboardDate).toLocaleString());
-            console.log('合约状态:', contract.status);
-            console.log('合约类型:', contract.contractType);
-            console.log('交割日期:', contract.deliveryDate);
-            console.log('价格精度:', contract.pricePrecision);
-            console.log('数量精度:', contract.quantityPrecision);
-            
-            // 显示交易规则
-            console.log('\n交易规则:');
-            contract.filters.forEach((filter, index) => {
-                console.log(`${index + 1}. ${filter.filterType}:`, filter);
-            });
-            
+            // console.log('合约状态:', contract.status);
+            // console.log('合约类型:', contract.contractType);
+            // console.log('交割日期:', contract.deliveryDate);
+            // console.log('价格精度:', contract.pricePrecision);
+            // console.log('数量精度:', contract.quantityPrecision);
             // 显示订单类型
-            console.log('\n支持的订单类型:', contract.orderTypes);
-            
             return contract;
         } else {
             console.log(`未找到 ${symbol} 合约信息`);
@@ -286,10 +276,10 @@ async function getCoinGeckoDetail(id = 'bitcoin') {
         console.log(`币种: ${data.name} (${data.symbol.toUpperCase()})`);
         console.log('当前价格:', m.current_price.usd, 'USD');
         console.log('市值:', m.market_cap.usd ? `$${(m.market_cap.usd / 1e9).toFixed(2)}B` : 'N/A');
-        console.log('流通供应量:', m.circulating_supply ? m.circulating_supply.toLocaleString() : 'N/A');
-        console.log('总供应量:', m.total_supply ? m.total_supply.toLocaleString() : 'N/A');
-        console.log('最大供应量:', m.max_supply ? m.max_supply.toLocaleString() : 'N/A');
-        console.log('24小时涨跌幅:', m.price_change_percentage_24h ? `${m.price_change_percentage_24h.toFixed(2)}%` : 'N/A');
+        // console.log('流通供应量:', m.circulating_supply ? m.circulating_supply.toLocaleString() : 'N/A');
+        // console.log('总供应量:', m.total_supply ? m.total_supply.toLocaleString() : 'N/A');
+        // console.log('最大供应量:', m.max_supply ? m.max_supply.toLocaleString() : 'N/A');
+        // console.log('24小时涨跌幅:', m.price_change_percentage_24h ? `${m.price_change_percentage_24h.toFixed(2)}%` : 'N/A');
         console.log('-----------------------------');
     } catch (err) {
         console.error('CoinGecko 查询失败:', err.message);
@@ -299,21 +289,94 @@ async function getCoinGeckoDetail(id = 'bitcoin') {
     }
 }
 
+// 封装函数：获取某个代币的所有信息
+async function getAllTokenInfo(symbol = 'BTCUSDT', coinGeckoId = null) {
+    try {
+        console.log('==========================================');
+        console.log(`🔍 正在获取 ${symbol} 的所有信息...`);
+        console.log('==========================================');
+        
+        const results = {
+            symbol: symbol,
+            contractInfo: null,
+            openInterest: null,
+            marketInfo: null,
+            timestamp: new Date().toLocaleString()
+        };
+        
+        // 1. 获取合约交易规则和上线时间
+        console.log('\n📋 1. 获取合约交易规则...');
+        results.contractInfo = await getContractTradingRules(symbol);
+        
+        // 2. 获取当前持仓量信息
+        console.log('\n📊 2. 获取当前持仓量信息...');
+        results.openInterest = await getCurrentOpenInterestValue(symbol);
+        
+        // 3. 获取最近三天持仓量趋势
+        console.log('\n📈 3. 获取最近三天持仓量趋势...');
+        await getThreeDaysOpenInterest(symbol);
+
+        // 4. 获取市值信息（如果有coinGeckoId）
+        if (coinGeckoId) {
+            console.log('\n💰 4. 获取市值信息...');
+            await getCoinGeckoDetail(coinGeckoId);
+        }
+        
+        console.log('\n==========================================');
+        console.log(`✅ ${symbol} 信息获取完成！`);
+        console.log('==========================================');
+        
+        return results;
+        
+    } catch (error) {
+        console.error('获取代币信息失败:', error.message);
+        return null;
+    }
+}
+
+// 批量获取多个代币信息
+async function getMultipleTokensInfo(tokens = [
+    { symbol: 'BTCUSDT', coinGeckoId: 'bitcoin' },
+    { symbol: 'ETHUSDT', coinGeckoId: 'ethereum' },
+    { symbol: 'BNBUSDT', coinGeckoId: 'binancecoin' }
+]) {
+    console.log('🚀 开始批量获取代币信息...');
+    console.log('==========================================');
+    
+    const results = [];
+    
+    for (let i = 0; i < tokens.length; i++) {
+        const token = tokens[i];
+        console.log(`\n[${i + 1}/${tokens.length}] 处理 ${token.symbol}...`);
+        
+        const result = await getAllTokenInfo(token.symbol, token.coinGeckoId);
+        if (result) {
+            results.push(result);
+        }
+        
+        // 添加延迟避免API限制
+        if (i < tokens.length - 1) {
+            console.log('⏳ 等待2秒...');
+            await new Promise(resolve => setTimeout(resolve, 2000));
+        }   
+    }
+    
+    console.log('\n==========================================');
+    console.log(`✅ 批量获取完成！共处理 ${results.length} 个代币`);
+    console.log('==========================================');
+    
+    return results;
+}
 
 async function main() {
-    // 1. 查询合约交易规则和上线时间
-    await getContractTradingRules('BTCUSDT');
-    
-     await getCoinGeckoMarketInfo(['bitcoin']);
-    
-    // 7. 查询最近三天的持仓量信息
-    await getThreeDaysOpenInterest('BTCUSDT');
-    
-    // 8. 查询当前持仓总价值
-    await getCurrentOpenInterestValue('BTCUSDT');
-    
-    // 9. 查询持仓量历史数据（保持原有逻辑）
-    await getOpenInterestHistory('BTCUSDT', '1h', 10);
+    // 单个代币信息获取示例
+    // await getAllTokenInfo('BTCUSDT', 'bitcoin');
+    // 批量代币信息获取示例
+    await getMultipleTokensInfo([
+        { symbol: 'BNBUSDT', coinGeckoId: 'binancecoin' },
+        { symbol: 'ETHUSDT', coinGeckoId: 'ethereum' }
+    ]);
+
 }
 
 main();
