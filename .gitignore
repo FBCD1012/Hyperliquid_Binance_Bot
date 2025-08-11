@@ -1,4 +1,10 @@
 node_modules/
 .env
 
+# Google API 相关文件（包含敏感信息）
+src/Google/
+src/Google/*.json
+src/Google/*.js
+src/Google/node_modules/
+
 # 其他你想忽略的文件或文件夹
