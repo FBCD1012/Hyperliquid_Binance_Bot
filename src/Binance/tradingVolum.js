@@ -2,17 +2,58 @@ const WebSocket = require('ws');
 const axios = require('axios');
 const { HttpsProxyAgent } = require('https-proxy-agent');
 
-const path = require('path');
-const fs = require('fs');
-
-
-
 const proxy = 'http://127.0.0.1:7897';
 const agent = new HttpsProxyAgent(proxy);
 
 // Telegram Bot 配置
-const TELEGRAM_BOT_TOKEN ='8375668476:AAHhAhNRkvZl_x2JxiQFi1EAY52lKIDPCkw';
-const TELEGRAM_CHAT_ID ='-1002642354005';
+const TELEGRAM_BOT_TOKEN ='';
+const TELEGRAM_CHAT_ID = '';
+
+// 交易策略配置
+const TRADING_CONFIG = {
+    // 价格变化阈值：只有当价格上升超过这个百分比时才报警
+    // 设置为0表示只要价格上升就报警，设置为正数表示需要上升超过该百分比
+    // 例如：设置为1.0表示价格需要上升超过1%才报警
+    MIN_PRICE_INCREASE_PERCENT: 0.0,
+    
+    // 买入量放量阈值：只有当买入量超过平均值的这个百分比时才报警
+    // 例如：设置为150.0表示买入量需要超过平均值的150%才报警（降低阈值，更容易触发）
+    MIN_VOLUME_INCREASE_PERCENT: 150.0,
+    
+    // 单根K线极端放量阈值：单根K线买入量超过平均值的这个百分比时触发推送
+    // 例如：设置为250.0表示单根K线买入量需要超过平均值的250%才推送（提高阈值，减少误报）
+    SINGLE_KLINE_EXTREME_VOLUME_PERCENT: 250.0
+};
+
+// 连接管理配置
+const CONNECTION_CONFIG = {
+    // 重连策略配置
+    INITIAL_RETRY_DELAY: 5000,      // 初始重连延迟（毫秒）
+    MAX_RETRY_DELAY: 60000,         // 最大重连延迟（毫秒）
+    RETRY_BACKOFF_MULTIPLIER: 2,    // 重连延迟倍数
+    MAX_RETRY_ATTEMPTS: 10          // 最大重连尝试次数
+};
+
+// 重连延迟计算函数
+function calculateRetryDelay(symbol) {
+    // 从multiManager的retryQueue获取重试次数
+    let retryCount = 0;
+    if (multiManager && multiManager.retryQueue && multiManager.retryQueue.has(symbol)) {
+        retryCount = multiManager.retryQueue.get(symbol).retryCount || 0;
+    }
+    
+    if (retryCount >= CONNECTION_CONFIG.MAX_RETRY_ATTEMPTS) {
+        // 超过最大重试次数，使用最大延迟
+        return CONNECTION_CONFIG.MAX_RETRY_DELAY;
+    }
+    
+    // 指数退避策略：延迟时间逐渐增加
+    const delay = CONNECTION_CONFIG.INITIAL_RETRY_DELAY * 
+                  Math.pow(CONNECTION_CONFIG.RETRY_BACKOFF_MULTIPLIER, retryCount);
+    
+    // 确保不超过最大延迟
+    return Math.min(delay, CONNECTION_CONFIG.MAX_RETRY_DELAY);
+}
 
 // Telegram Bot 实例
 const TelegramBot = require('node-telegram-bot-api');
@@ -30,14 +71,30 @@ async function sendToTelegram(message) {
             console.log('⚠️ Telegram配置未设置，跳过发送');
             return;
         }
+
+        // 验证Chat ID格式
+        if (!TELEGRAM_CHAT_ID.startsWith('-100') && !TELEGRAM_CHAT_ID.startsWith('-') && !/^\d+$/.test(TELEGRAM_CHAT_ID)) {
+            console.log('⚠️ Telegram Chat ID格式无效，应该是数字或-100开头的群组ID');
+            return;
+        }
         
         const response = await bot.sendMessage(TELEGRAM_CHAT_ID, message, { 
             disable_web_page_preview: true
         });
         console.log('✅ Telegram消息发送成功');
     } catch (error) {
-        console.error('❌ Telegram发送失败:', error.message);
-        console.error('错误详情:', error);
+        if (error.message.includes('chat not found')) {
+            console.error('❌ Telegram发送失败: Chat ID不存在或Bot无权限访问');
+            console.error('💡 请检查:');
+            console.error('   1. Chat ID是否正确 (当前: ' + TELEGRAM_CHAT_ID + ')');
+            console.error('   2. Bot是否已添加到该群组/频道');
+            console.error('   3. Bot是否有发送消息权限');
+        } else if (error.message.includes('Unauthorized')) {
+            console.error('❌ Telegram发送失败: Bot Token无效');
+            console.error('💡 请检查Bot Token是否正确');
+        } else {
+            console.error('❌ Telegram发送失败:', error.message);
+        }
     }
 }
 
@@ -59,97 +116,56 @@ async function processTelegramQueue() {
     
     isProcessingTelegramQueue = true;
     
-    // 使用信号量控制并发发送
-    const telegramSemaphore = new Semaphore(3); // 最多3个并发发送
-    const queueItems = [...telegramQueue]; // 复制队列，避免并发修改
-    telegramQueue.length = 0; // 清空原队列
-    
-    console.log(`📤 开始处理 ${queueItems.length} 条Telegram消息...`);
-    
-    // 并行处理消息，但控制并发数
-    const messagePromises = queueItems.map(async (message) => {
-        return telegramSemaphore.acquire().then(async (release) => {
-            try {
-                const now = Date.now();
-                const timeSinceLastSend = now - lastTelegramSendTime;
-                
-                // 如果距离上次发送时间不足限制，则等待
-                if (timeSinceLastSend < TELEGRAM_RATE_LIMIT) {
-                    const waitTime = TELEGRAM_RATE_LIMIT - timeSinceLastSend;
-                    await new Promise(resolve => setTimeout(resolve, waitTime));
-                }
-                
-                // 检查消息去重
-                const messageHash = hashMessage(message);
-                const lastSentTime = messageDeduplicationCache.get(messageHash);
-                
-                if (lastSentTime && (now - lastSentTime < DEDUPLICATION_WINDOW)) {
-                    console.log('🔄 跳过重复消息（1分钟内已发送过）');
-                    release();
-                    return { success: false, reason: 'duplicate' };
-                }
-                
-                await sendToTelegram(message);
-                lastTelegramSendTime = Date.now();
-                messageDeduplicationCache.set(messageHash, now);
-                
-                release();
-                return { success: true };
-                
-            } catch (error) {
-                release();
-                console.error('❌ 队列消息发送失败:', error.message);
-                
-                // 如果是429错误，等待更长时间
-                if (error.message.includes('429')) {
-                    console.log('⏳ 遇到速率限制，等待10秒后重试...');
-                    await new Promise(resolve => setTimeout(resolve, 10000));
-                }
-                
-                return { success: false, error: error.message };
-            }
-        });
-    });
-    
-    // 等待所有消息处理完成
-    const results = await Promise.allSettled(messagePromises);
-    let successCount = 0;
-    let failCount = 0;
-    let duplicateCount = 0;
-    
-    results.forEach((result) => {
-        if (result.status === 'fulfilled') {
-            const { success, reason, error } = result.value;
-            if (success) {
-                successCount++;
-            } else if (reason === 'duplicate') {
-                duplicateCount++;
-            } else {
-                failCount++;
-                console.error('消息发送失败:', error);
-            }
-        } else {
-            failCount++;
-            console.error('消息处理异常:', result.reason);
+    while (telegramQueue.length > 0) {
+        const now = Date.now();
+        const timeSinceLastSend = now - lastTelegramSendTime;
+        
+        // 如果距离上次发送时间不足1.5秒，则等待
+        if (timeSinceLastSend < TELEGRAM_RATE_LIMIT) {
+            const waitTime = TELEGRAM_RATE_LIMIT - timeSinceLastSend;
+            await new Promise(resolve => setTimeout(resolve, waitTime));
         }
-    });
-    
-    // 清理过期的去重缓存
-    const now = Date.now();
-    for (const [hash, timestamp] of messageDeduplicationCache.entries()) {
-        if (now - timestamp > DEDUPLICATION_WINDOW) {
-            messageDeduplicationCache.delete(hash);
+        
+        const message = telegramQueue.shift();
+        
+        // 检查消息去重
+        const messageHash = hashMessage(message);
+        const lastSentTime = messageDeduplicationCache.get(messageHash);
+        
+        if (lastSentTime && (now - lastSentTime < DEDUPLICATION_WINDOW)) {
+            console.log('🔄 跳过重复消息（1分钟内已发送过）');
+            continue;
+        }
+        
+        try {
+            await sendToTelegram(message);
+            lastTelegramSendTime = Date.now();
+            messageDeduplicationCache.set(messageHash, now);
+            
+            // 清理过期的去重缓存
+            for (const [hash, timestamp] of messageDeduplicationCache.entries()) {
+                if (now - timestamp > DEDUPLICATION_WINDOW) {
+                    messageDeduplicationCache.delete(hash);
+                }
+            }
+            
+        } catch (error) {
+            console.error('❌ 队列消息发送失败:', error.message);
+            
+            // 如果是429错误，等待更长时间
+            if (error.message.includes('429')) {
+                console.log('⏳ 遇到速率限制，等待10秒后重试...');
+                telegramQueue.unshift(message);
+                await new Promise(resolve => setTimeout(resolve, 10000));
+            } else {
+                // 其他错误，等待5秒后重试
+                telegramQueue.unshift(message);
+                await new Promise(resolve => setTimeout(resolve, 5000));
+            }
         }
     }
-    
-    console.log(`📤 Telegram消息处理完成: ${successCount} 个成功, ${duplicateCount} 个重复, ${failCount} 个失败`);
     
     isProcessingTelegramQueue = false;
-    
-    // 如果还有失败的消息，可以考虑重新加入队列
-    if (failCount > 0 && queueItems.length > 0) {
-        console.log(`⚠️ 有 ${failCount} 条消息发送失败，请检查网络连接`);
-    }
 }
 
 // 简单的消息哈希函数
@@ -162,6 +178,33 @@ function enqueueTelegramMessage(message) {
     telegramQueue.push(message);
     console.log(`📝 消息已加入队列，当前队列长度: ${telegramQueue.length}`);
     processTelegramQueue();
+}
+
+// 验证Telegram配置
+function validateTelegramConfig() {
+    console.log('🔍 验证Telegram配置...');
+    
+    if (!TELEGRAM_BOT_TOKEN || TELEGRAM_BOT_TOKEN === 'your_bot_token_here') {
+        console.log('❌ Telegram Bot Token未设置');
+        return false;
+    }
+    
+    if (!TELEGRAM_CHAT_ID || TELEGRAM_CHAT_ID === 'your_chat_id_here') {
+        console.log('❌ Telegram Chat ID未设置');
+        return false;
+    }
+    
+    // 验证Chat ID格式
+    if (!TELEGRAM_CHAT_ID.startsWith('-100') && !TELEGRAM_CHAT_ID.startsWith('-') && !/^\d+$/.test(TELEGRAM_CHAT_ID)) {
+        console.log('❌ Telegram Chat ID格式无效');
+        console.log('💡 群组/频道ID应该以-100开头，个人聊天ID应该是纯数字');
+        return false;
+    }
+    
+    console.log('✅ Telegram配置验证通过');
+    console.log(`   Bot Token: ${TELEGRAM_BOT_TOKEN.substring(0, 10)}...`);
+    console.log(`   Chat ID: ${TELEGRAM_CHAT_ID}`);
+    return true;
 }
 
 // 已完成K线告警去重（每根K线只推一次）
@@ -272,31 +315,9 @@ const CONFIG = {
     apiUrl: 'https://fapi.binance.com/fapi/v1/klines',
     wsBaseUrl: 'wss://fstream.binance.com/ws/',
     
-    // 并发控制配置
-    maxConcurrentConnections: 150, // 增加最大并发连接数
-    maxConcurrentAPIRequests: 20,  // API请求并发限制
-    connectionRetryDelay: 3000,    // 连接重试延迟
-    maxRetryAttempts: 3,           // 最大重试次数
-    batchProcessingDelay: 200,     // 批次间处理延迟
-    
-    // 监控配置
-    maxSymbols: 500,
-    klineInterval: '1m',
-    maxKlineLength: 30,
-    
-    // 异常检测配置
-    volumeThreshold: 2.0,
-    consecutiveThreshold: 3,
-    timeWindow: 5 * 60 * 1000, // 5分钟
-    
-    // 清理配置
-    cleanupInterval: 10 * 60 * 1000, // 10分钟
-    connectionTimeout: 30 * 1000, // 30秒
-    maxInactiveTime: 5 * 60 * 1000, // 5分钟
-    
     // 默认监控的币种列表 - 您可以在这里修改想要监控的币种
     defaultSymbols: [
-    'ALCHUSDT',
+       'ALCHUSDT',
     'ALICEUSDT',
     'OPUSDT',
     'KAIAUSDT',
@@ -867,1004 +888,792 @@ const POPULAR_SYMBOLS = [
     'FUSDT', 'PIPPINUSDT', 'PORT3USDT'
 ];
 
-// 信号量类 - 用于控制并发数量
-class Semaphore {
-    constructor(maxConcurrent) {
-        this.maxConcurrent = maxConcurrent;
-        this.currentCount = 0;
-        this.waitingQueue = [];
-    }
-
-    async acquire() {
-        if (this.currentCount < this.maxConcurrent) {
-            this.currentCount++;
-            return Promise.resolve(() => this.release());
-        }
-        
-        return new Promise((resolve) => {
-            this.waitingQueue.push(resolve);
-        }).then(() => {
-            this.currentCount++;
-            return () => this.release();
-        });
-    }
-
-    release() {
-        this.currentCount--;
-        if (this.waitingQueue.length > 0) {
-            const next = this.waitingQueue.shift();
-            next();
-        }
-    }
-}
-
-// 连接重试管理器
-class ConnectionRetryManager {
-    constructor(maxRetries = CONFIG.maxRetryAttempts, baseDelay = CONFIG.connectionRetryDelay) {
-        this.maxRetries = maxRetries;
-        this.baseDelay = baseDelay;
-        this.retryCounts = new Map(); // symbol -> retry count
-        this.lastRetryTime = new Map(); // symbol -> last retry timestamp
-        this.retryCooldown = 30000; // 30秒冷却期，避免频繁重连
-        this.connectionStates = new Map(); // symbol -> connection state
-    }
-
-    shouldRetry(symbol) {
-        const retryCount = this.retryCounts.get(symbol) || 0;
-        return retryCount < this.maxRetries;
-    }
-
-    canRetry(symbol) {
-        const lastTime = this.lastRetryTime.get(symbol) || 0;
-        const retryCount = this.retryCounts.get(symbol) || 0;
-        
-        // 检查是否在冷却期内
-        if (Date.now() - lastTime < this.retryCooldown) {
-            return false;
-        }
-        
-        // 检查重试次数
-        return retryCount < this.maxRetries;
-    }
-
-    incrementRetryCount(symbol) {
-        const currentCount = this.retryCounts.get(symbol) || 0;
-        const newCount = currentCount + 1;
-        this.retryCounts.set(symbol, newCount);
-        this.lastRetryTime.set(symbol, Date.now());
-        
-        // 更新连接状态
-        this.connectionStates.set(symbol, {
-            status: 'retrying',
-            retryCount: newCount,
-            lastRetryTime: Date.now(),
-            nextRetryTime: Date.now() + this.getRetryDelay(symbol)
-        });
-        
-        return newCount;
-    }
-
-    getRetryDelay(symbol) {
-        const retryCount = this.retryCounts.get(symbol) || 0;
-        // 指数退避策略，但设置最大延迟
-        const delay = Math.min(this.baseDelay * Math.pow(2, retryCount), 60000);
-        return delay;
-    }
-
-    resetRetryCount(symbol) {
-        this.retryCounts.delete(symbol);
-        this.lastRetryTime.delete(symbol);
-        this.connectionStates.set(symbol, {
-            status: 'connected',
-            retryCount: 0,
-            lastRetryTime: null,
-            nextRetryTime: null
-        });
-    }
-
-    getConnectionState(symbol) {
-        return this.connectionStates.get(symbol) || {
-            status: 'unknown',
-            retryCount: 0,
-            lastRetryTime: null,
-            nextRetryTime: null
-        };
-    }
-
-    // 清理过期的重试记录
-    cleanup() {
-        const now = Date.now();
-        const cleanupThreshold = 30 * 60 * 1000; // 30分钟
-        
-        for (const [symbol, lastTime] of this.lastRetryTime.entries()) {
-            if (now - lastTime > cleanupThreshold) {
-                this.retryCounts.delete(symbol);
-                this.lastRetryTime.delete(symbol);
-                this.connectionStates.delete(symbol);
-            }
-        }
-    }
-}
-
-// 全局重试管理器实例
-const retryManager = new ConnectionRetryManager();
-
+// K线数据管理器
 class MultiSymbolKlineManager {
     constructor() {
-        this.symbols = new Map(); // symbol -> KlineManager
-        this.connections = new Map(); // symbol -> WebSocket
-        this.connectionPool = new Map(); // 连接池管理
-        this.maxConnections = CONFIG.maxConcurrentConnections; // 使用配置的最大并发连接数
+        this.symbols = new Map();
+        this.connections = new Map();
+        this.maxConnections = 500; // 增加到500以支持大规模监控
         this.connectionQueue = []; // 连接队列
         this.isProcessingQueue = false;
-        this.connectionSemaphore = 0; // 连接信号量控制
-        this.apiRequestSemaphore = 0; // API请求信号量控制
-        this.retryAttempts = new Map(); // 记录重试次数
-        this.connectionHealth = new Map(); // 连接健康状态
-        this.stats = {
-            totalSymbols: 0,
-            activeConnections: 0,
-            queuedConnections: 0,
-            memoryUsage: 0,
-            failedConnections: 0,
-            retryCount: 0,
+        this.batchSize = 50; // 增加批处理大小，提高效率
+        this.batchDelay = 1000; // 减少批次间延迟，加快处理速度
+        this.maxRetries = 3; // 最大重试次数
+        this.connectionTimeout = 10000; // 连接超时时间（毫秒）
+        this.healthCheckInterval = 30000; // 健康检查间隔（毫秒）
+        this.memoryThreshold = 0.8; // 内存使用阈值（80%）
+        
+        // 性能监控
+        this.performanceMetrics = {
+            totalConnections: 0,
             successfulConnections: 0,
-            dataReceivedCount: 0,
-            lastDataTime: null,
-            connectionErrors: 0,
-            reconnectionAttempts: 0
+            failedConnections: 0,
+            avgConnectionTime: 0,
+            memoryUsage: 0
         };
         
-        // 启动定期清理任务
-        this.startCleanupTasks();
+        // 启动健康检查
+        this.startHealthCheck();
     }
 
-    // 更新连接统计信息
-    updateConnectionStats() {
-        this.stats.activeConnections = this.connections.size;
-        this.stats.queuedConnections = this.connectionQueue.length;
-        this.stats.totalSymbols = this.symbols.size;
-    }
-
-    // 启动定期清理任务
-    startCleanupTasks() {
-        // 每5分钟清理一次不活跃连接
-        setInterval(() => {
-            this.cleanupInactiveConnections();
-        }, 5 * 60 * 1000);
-        
-        // 每10分钟优化一次内存
-        setInterval(() => {
-            this.optimizeMemory();
-        }, 10 * 60 * 1000);
-        
-        // 每30秒处理连接队列
-        setInterval(() => {
-            if (this.connectionQueue.length > 0 && !this.isProcessingQueue) {
-                this.processConnectionQueue();
-            }
-        }, 30000);
-        
-        // 每2分钟检查连接健康状态
-        setInterval(() => {
-            this.checkConnectionHealth();
-        }, 2 * 60 * 1000);
-        
-        // 每5分钟清理重试管理器
-        setInterval(() => {
-            retryManager.cleanup();
-        }, 5 * 60 * 1000);
-    }
-
-    // 添加新的监控币种（支持批量添加）
     addSymbol(symbol) {
-        if (!this.symbols.has(symbol)) {
-            this.symbols.set(symbol, new KlineManager(CONFIG.historyLimit, symbol));
-            this.updateConnectionStats();
-            console.log(`✅ 添加监控币种: ${symbol} (总数: ${this.stats.totalSymbols})`);
-            
-            // 检查连接池容量
-            if (this.stats.activeConnections < this.maxConnections) {
-                this.connectSymbol(symbol);
-            } else {
-                this.queueConnection(symbol);
-            }
-            return true;
+        if (this.symbols.has(symbol)) {
+            return false; // 币种已存在
         }
-        console.log(`⚠️ ${symbol} 已在监控列表中`);
-        return false;
+
+        const klineManager = new KlineManager(CONFIG.historyLimit, symbol);
+        this.symbols.set(symbol, klineManager);
+        console.log(`📊 币种 ${symbol} 已添加到监控列表`);
+        return true;
     }
 
-    // 批量添加币种（优化版本 - 并行处理）
-    async addSymbols(symbols) {
-        console.log(`🔄 批量添加 ${symbols.length} 个币种...`);
-        let addedCount = 0;
+    // 新增：批量添加币种
+    async addSymbolsBatch(symbols, showProgress = true) {
+        const totalSymbols = symbols.length;
+        const batches = Math.ceil(totalSymbols / this.batchSize);
         
-        // 第一步：快速添加所有币种到管理器
-        const symbolsToAdd = [];
-        for (const symbol of symbols) {
-            if (!this.symbols.has(symbol)) {
-                this.symbols.set(symbol, new KlineManager(CONFIG.historyLimit, symbol));
-                symbolsToAdd.push(symbol);
-                addedCount++;
+        if (showProgress) {
+            console.log(`🔄 开始批量添加 ${totalSymbols} 个币种，分 ${batches} 批处理...`);
+            console.log(`⚙️ 配置: 批大小=${this.batchSize}, 延迟=${this.batchDelay}ms, 最大连接=${this.maxConnections}`);
+        }
+
+        let successCount = 0;
+        let failCount = 0;
+        const startTime = Date.now();
+
+        for (let i = 0; i < batches; i++) {
+            const startIndex = i * this.batchSize;
+            const endIndex = Math.min(startIndex + this.batchSize, totalSymbols);
+            const batchSymbols = symbols.slice(startIndex, endIndex);
+
+            if (showProgress) {
+                console.log(`\n📦 处理第 ${i + 1}/${batches} 批 (${startIndex + 1}-${endIndex}/${totalSymbols})`);
             }
-        }
-        
-        this.stats.totalSymbols = this.symbols.size;
-        console.log(`✅ 已添加 ${addedCount} 个币种到管理器`);
-        
-        if (symbolsToAdd.length === 0) {
-            console.log('⚠️ 所有币种都已存在，无需添加');
-            return 0;
-        }
-        
-        // 第二步：并行获取历史数据（使用信号量控制并发）
-        console.log(`📊 开始并行获取历史数据...`);
-        const batchSize = CONFIG.maxConcurrentAPIRequests; // 使用配置的API请求并发限制
-        const batches = [];
-        
-        for (let i = 0; i < symbolsToAdd.length; i += batchSize) {
-            batches.push(symbolsToAdd.slice(i, i + batchSize));
-        }
-        
-        let processedCount = 0;
-        let failedCount = 0;
-        
-        for (let batchIndex = 0; batchIndex < batches.length; batchIndex++) {
-            const batch = batches[batchIndex];
-            console.log(`🔄 处理第 ${batchIndex + 1}/${batches.length} 批 (${batch.length} 个币种)...`);
-            
-            // 使用信号量控制并发
-            const semaphore = new Semaphore(CONFIG.maxConcurrentAPIRequests);
-            const promises = batch.map(async (symbol) => {
-                return semaphore.acquire().then(async (release) => {
-                    try {
-                        const success = await this.fetchHistoricalKlinesWithRetry(symbol);
-                        release();
+
+            // 检查内存使用情况
+            const memoryUsage = process.memoryUsage();
+            const memoryUsageMB = Math.round(memoryUsage.heapUsed / 1024 / 1024);
+            if (showProgress) {
+                console.log(`💾 当前内存使用: ${memoryUsageMB}MB`);
+            }
+
+            // 如果内存使用过高，暂停处理
+            if (memoryUsage.heapUsed / memoryUsage.heapTotal > this.memoryThreshold) {
+                console.log(`⚠️ 内存使用过高 (${Math.round(memoryUsage.heapUsed / memoryUsage.heapTotal * 100)}%)，暂停处理...`);
+                await new Promise(resolve => setTimeout(resolve, 5000));
+            }
+
+            // 并行处理当前批次的币种
+            const batchPromises = batchSymbols.map(async (symbol) => {
+                try {
+                    // 添加到监控列表
+                    if (this.addSymbol(symbol)) {
+                        // 获取历史数据
+                        const success = await fetchHistoricalKlines(symbol);
                         if (success) {
+                            // 加入连接队列
+                            this.addToConnectionQueue(symbol);
+                            successCount++;
+                            if (showProgress) {
+                                console.log(`✅ ${symbol} 准备就绪，加入连接队列`);
+                            }
                             return { symbol, success: true };
                         } else {
+                            failCount++;
+                            if (showProgress) {
+                                console.log(`❌ ${symbol} 历史数据获取失败`);
+                            }
                             return { symbol, success: false, error: '历史数据获取失败' };
                         }
-                    } catch (error) {
-                        release();
-                        return { symbol, success: false, error: error.message };
+                    } else {
+                        failCount++;
+                        if (showProgress) {
+                            console.log(`❌ ${symbol} 添加失败（已存在）`);
+                        }
+                        return { symbol, success: false, error: '币种已存在' };
                     }
-                });
+                } catch (error) {
+                    failCount++;
+                    if (showProgress) {
+                        console.log(`❌ ${symbol} 处理出错: ${error.message}`);
+                    }
+                    return { symbol, success: false, error: error.message };
+                }
             });
-            
+
             // 等待当前批次完成
-            const results = await Promise.allSettled(promises);
-            const successfulSymbols = [];
+            const batchResults = await Promise.all(batchPromises);
             
-            results.forEach((result) => {
-                if (result.status === 'fulfilled' && result.value.success) {
-                    successfulSymbols.push(result.value.symbol);
-                    processedCount++;
-                } else {
-                    const symbol = result.status === 'fulfilled' ? result.value.symbol : 'unknown';
-                    console.log(`❌ ${symbol} 历史数据获取失败`);
-                    failedCount++;
-                }
-            });
-            
-            // 第三步：并行建立WebSocket连接
-            if (successfulSymbols.length > 0) {
-                console.log(`🔗 为 ${successfulSymbols.length} 个币种建立WebSocket连接...`);
+            if (showProgress) {
+                const batchSuccess = batchResults.filter(r => r.success).length;
+                const batchFail = batchResults.filter(r => !r.success).length;
+                console.log(`📊 第 ${i + 1} 批完成: 成功 ${batchSuccess} 个，失败 ${batchFail} 个`);
                 
-                // 使用连接信号量控制并发连接数
-                const connectionSemaphore = new Semaphore(this.maxConnections);
-                const connectionPromises = successfulSymbols.map(async (symbol) => {
-                    return connectionSemaphore.acquire().then(async (release) => {
-                        try {
-                            const success = await this.connectSymbolWithRetry(symbol);
-                            release();
-                            return { symbol, success };
-                        } catch (error) {
-                            release();
-                            return { symbol, success: false, error: error.message };
-                        }
-                    });
-                });
-                
-                const connectionResults = await Promise.allSettled(connectionPromises);
-                let connectedCount = 0;
-                
-                connectionResults.forEach((result) => {
-                    if (result.status === 'fulfilled' && result.value.success) {
-                        connectedCount++;
-                    }
-                });
-                
-                console.log(`✅ 第 ${batchIndex + 1} 批完成: ${connectedCount}/${successfulSymbols.length} 个已连接`);
+                // 显示进度
+                const progress = Math.round(((i + 1) / batches) * 100);
+                const elapsed = Math.round((Date.now() - startTime) / 1000);
+                console.log(`📈 总体进度: ${progress}% (${elapsed}s)`);
             }
-            
+
             // 批次间延迟，避免API限制
-            if (batchIndex < batches.length - 1) {
-                await new Promise(resolve => setTimeout(resolve, CONFIG.batchProcessingDelay));
+            if (i < batches - 1) {
+                if (showProgress) {
+                    console.log(`⏳ 等待 ${this.batchDelay/1000} 秒后处理下一批...`);
+                }
+                await new Promise(resolve => setTimeout(resolve, this.batchDelay));
             }
         }
+
+        const totalTime = Math.round((Date.now() - startTime) / 1000);
         
-        console.log(`🎉 批量添加完成！成功处理 ${processedCount}/${addedCount} 个币种，失败 ${failedCount} 个`);
-        
-        // 更新统计信息
-        this.updateConnectionStats();
-        
-        // 处理连接队列
-        if (this.connectionQueue.length > 0) {
-            console.log(`⏳ 开始处理连接队列中的 ${this.connectionQueue.length} 个币种...`);
-            this.processConnectionQueue();
+        if (showProgress) {
+            console.log(`\n🎉 批量添加完成！`);
+            console.log(`📊 结果统计: 成功 ${successCount} 个，失败 ${failCount} 个，总耗时 ${totalTime} 秒`);
+            console.log(`⚡ 平均速度: ${Math.round(totalSymbols / totalTime)} 个/秒`);
         }
-        
-        return processedCount;
+
+        return {
+            total: totalSymbols,
+            successCount,
+            failCount,
+            totalTime,
+            avgSpeed: Math.round(totalSymbols / totalTime)
+        };
     }
 
-    // 连接单个币种
-    async connectSymbol(symbol) {
-        if (this.stats.activeConnections >= this.maxConnections) {
-            this.queueConnection(symbol);
-            return false;
-        }
-
-        try {
-            await this.fetchHistoricalKlinesWithRetry(symbol);
-            const success = await this.connectWebSocketWithRetry(symbol);
-            if (success) {
-                this.updateConnectionStats();
-                retryManager.resetRetryCount(symbol);
-                // 更新连接健康状态
-                this.connectionHealth.set(symbol, {
-                    status: 'connected',
-                    lastUpdate: Date.now(),
-                    errorCount: 0
-                });
-            }
-            return success;
-        } catch (error) {
-            console.error(`❌ ${symbol} 连接失败:`, error.message);
-            this.stats.failedConnections++;
-            this.stats.connectionErrors++;
-            this.updateConnectionStats();
-            return false;
-        }
-    }
-
-    // 带重试的历史数据获取
-    async fetchHistoricalKlinesWithRetry(symbol) {
-        let attempts = 0;
-        const maxAttempts = CONFIG.maxRetryAttempts;
-        
-        while (attempts < maxAttempts) {
-            try {
-                const success = await fetchHistoricalKlines(symbol);
-                if (success) {
-                    return true;
-                }
-                attempts++;
-            } catch (error) {
-                attempts++;
-                console.warn(`⚠️ ${symbol} 历史数据获取失败 (尝试 ${attempts}/${maxAttempts}):`, error.message);
-                
-                if (attempts < maxAttempts) {
-                    const delay = retryManager.getRetryDelay(symbol);
-                    await new Promise(resolve => setTimeout(resolve, delay));
-                }
-            }
-        }
-        
-        console.error(`❌ ${symbol} 历史数据获取最终失败，已尝试 ${maxAttempts} 次`);
-        return false;
-    }
-
-    // 带重试的WebSocket连接
-    async connectWebSocketWithRetry(symbol) {
-        let attempts = 0;
-        const maxAttempts = CONFIG.maxRetryAttempts;
-        
-        while (attempts < maxAttempts) {
-            try {
-                const ws = await this.createWebSocketConnection(symbol);
-                if (ws && ws.readyState === WebSocket.OPEN) {
-                    this.setConnection(symbol, ws);
-                    return true;
-                }
-                attempts++;
-            } catch (error) {
-                attempts++;
-                console.warn(`⚠️ ${symbol} WebSocket连接失败 (尝试 ${attempts}/${maxAttempts}):`, error.message);
-                
-                if (attempts < maxAttempts) {
-                    const delay = retryManager.getRetryDelay(symbol);
-                    await new Promise(resolve => setTimeout(resolve, delay));
-                }
-            }
-        }
-        
-        console.error(`❌ ${symbol} WebSocket连接最终失败，已尝试 ${maxAttempts} 次`);
-        return false;
-    }
-
-    // 创建WebSocket连接
-    createWebSocketConnection(symbol) {
-        return new Promise((resolve, reject) => {
-            const wsUrl = `${CONFIG.wsBaseUrl}${symbol.toLowerCase()}@kline_${CONFIG.interval}`;
-            
-            const ws = new WebSocket(wsUrl, {
-                agent: agent,
-                handshakeTimeout: 15000,
-                headers: { 
-                    'User-Agent': 'Mozilla/5.0 (Multi-Symbol Volume Monitor)'
-                }
-            });
-
-            const timeout = setTimeout(() => {
-                ws.terminate();
-                reject(new Error('连接超时'));
-            }, 15000);
-
-            ws.on('open', () => {
-                clearTimeout(timeout);
-                console.log(`🔗 ${symbol} WebSocket连接成功`);
-                this.setupWebSocketHandlers(ws, symbol);
-                this.setConnection(symbol, ws); // 更新连接状态
-                
-                // 更新连接统计
-                if (this.stats) {
-                    this.stats.successfulConnections = (this.stats.successfulConnections || 0) + 1;
-                }
-                
-                // 更新连接健康状态
-                this.connectionHealth.set(symbol, {
-                    status: 'connected',
-                    lastUpdate: Date.now(),
-                    errorCount: 0
-                });
-                
-                resolve(ws);
-            });
-
-            ws.on('error', (error) => {
-                clearTimeout(timeout);
-                reject(error);
-            });
-        });
-    }
-
-    // 设置WebSocket事件处理器
-    setupWebSocketHandlers(ws, symbol) {
-        ws.on('message', (data) => {
-            try {
-                const message = JSON.parse(data);
-                const klineData = message.k;
-
-                if (klineData) {
-                    // 构建K线对象
-                    const currentKline = {
-                        openTime: parseInt(klineData.t),
-                        closeTime: parseInt(klineData.T),
-                        open: parseFloat(klineData.o),
-                        high: parseFloat(klineData.h),
-                        low: parseFloat(klineData.l),
-                        close: parseFloat(klineData.c),
-                        volume: parseFloat(klineData.v),
-                        quoteVolume: parseFloat(klineData.q),
-                        trades: parseInt(klineData.n),
-                        isCompleted: klineData.x, // K线是否已完成
-                        buyVolume: parseFloat(klineData.V || 0), // 主动买入的成交量
-                        buyQuoteVolume: parseFloat(klineData.Q || 0) // 主动买入的成交额
-                    };
-
-                    // 更新K线管理器（包括进行中的K线）
-                    const klineManager = this.getKlineManager(symbol);
-                    if (klineManager && klineManager.isInitialized) {
-                        klineManager.addKline(currentKline);
-                        
-                        // 如果K线已完成，进行详细分析
-                        if (klineData.x) {
-                            handleCompletedKline(symbol, currentKline);
-                        }
-                        // 如果是进行中的K线，进行实时监控
-                        else {
-                            handleOngoingKline(symbol, currentKline);
-                        }
-                        
-                        // 更新最后活动时间
-                        klineManager.lastUpdateTime = Date.now();
-                        
-                        // 更新数据接收统计
-                        if (this.stats) {
-                            this.stats.dataReceivedCount = (this.stats.dataReceivedCount || 0) + 1;
-                            this.stats.lastDataTime = Date.now();
-                        }
-                        
-                        // 每100条数据输出一次接收状态
-                        if (this.stats && this.stats.dataReceivedCount && this.stats.dataReceivedCount % 100 === 0) {
-                            console.log(`📡 数据接收状态: 已接收 ${this.stats.dataReceivedCount} 条K线数据`);
-                        }
-                    }
-                }
-            } catch (error) {
-                console.error(`❌ ${symbol} 消息处理失败:`, error.message);
-            }
-        });
-
-        ws.on('error', (error) => {
-            console.error(`❌ ${symbol} WebSocket错误:`, error.message);
-            this.handleWebSocketError(symbol, error);
-        });
-
-        ws.on('close', () => {
-            console.log(`⚠️ ${symbol} WebSocket连接断开`);
-            this.handleWebSocketClose(symbol);
-        });
-    }
-
-    // 处理WebSocket错误
-    handleWebSocketError(symbol, error) {
-        // 从连接映射中移除
-        if (this.connections.has(symbol)) {
-            this.connections.delete(symbol);
-            this.updateConnectionStats();
-        }
-        
-        // 更新失败连接统计
-        if (this.stats) {
-            this.stats.failedConnections = (this.stats.failedConnections || 0) + 1;
-            this.stats.connectionErrors = (this.stats.connectionErrors || 0) + 1;
-        }
-        
-        // 更新连接健康状态
-        const currentHealth = this.connectionHealth.get(symbol) || { errorCount: 0 };
-        this.connectionHealth.set(symbol, {
-            status: 'error',
-            lastUpdate: Date.now(),
-            errorCount: currentHealth.errorCount + 1,
-            lastError: error.message
-        });
-        
-        if (retryManager.canRetry(symbol)) {
-            const retryCount = retryManager.incrementRetryCount(symbol);
-            const delay = retryManager.getRetryDelay(symbol);
-            
-            console.log(`🔄 ${symbol} 将在 ${delay}ms 后尝试重连 (第 ${retryCount} 次重试)...`);
-            this.stats.reconnectionAttempts++;
-            
-            setTimeout(async () => {
-                if (this.symbols.has(symbol)) {
-                    await this.reconnectSymbol(symbol);
-                }
-            }, delay);
-        } else {
-            console.error(`❌ ${symbol} 重连次数已达上限或仍在冷却期内，移除监控`);
-            this.removeSymbol(symbol);
-        }
-    }
-
-    // 处理WebSocket关闭
-    handleWebSocketClose(symbol) {
-        // 从连接映射中移除
-        if (this.connections.has(symbol)) {
-            this.connections.delete(symbol);
-            this.updateConnectionStats();
-        }
-        
-        // 更新失败连接统计
-        if (this.stats) {
-            this.stats.failedConnections = (this.stats.failedConnections || 0) + 1;
-        }
-        
-        // 更新连接健康状态
-        const currentHealth = this.connectionHealth.get(symbol) || { errorCount: 0 };
-        this.connectionHealth.set(symbol, {
-            status: 'disconnected',
-            lastUpdate: Date.now(),
-            errorCount: currentHealth.errorCount,
-            lastError: 'Connection closed'
-        });
-        
-        if (retryManager.canRetry(symbol)) {
-            const retryCount = retryManager.incrementRetryCount(symbol);
-            const delay = retryManager.getRetryDelay(symbol);
-            
-            console.log(`🔄 ${symbol} 将在 ${delay}ms 后尝试重连 (第 ${retryCount} 次重试)...`);
-            this.stats.reconnectionAttempts++;
-            
-            setTimeout(async () => {
-                if (this.symbols.has(symbol)) {
-                    await this.reconnectSymbol(symbol);
-                }
-            }, delay);
-        } else {
-            console.error(`❌ ${symbol} 重连次数已达上限或仍在冷却期内，移除监控`);
-            this.removeSymbol(symbol);
-        }
-    }
-
-    // 重连币种
-    async reconnectSymbol(symbol) {
-        try {
-            console.log(`🔄 尝试重连 ${symbol}...`);
-            
-            // 更新连接健康状态
-            this.connectionHealth.set(symbol, {
-                status: 'reconnecting',
-                lastUpdate: Date.now(),
-                errorCount: 0
-            });
-            
-            const success = await this.connectWebSocketWithRetry(symbol);
-            if (success) {
-                console.log(`✅ ${symbol} 重连成功`);
-                this.connectionHealth.set(symbol, {
-                    status: 'connected',
-                    lastUpdate: Date.now(),
-                    errorCount: 0
-                });
-            } else {
-                console.error(`❌ ${symbol} 重连失败`);
-                this.connectionHealth.set(symbol, {
-                    status: 'failed',
-                    lastUpdate: Date.now(),
-                    errorCount: (this.connectionHealth.get(symbol)?.errorCount || 0) + 1
-                });
-            }
-            return success;
-        } catch (error) {
-            console.error(`❌ ${symbol} 重连异常:`, error.message);
-            this.connectionHealth.set(symbol, {
-                status: 'error',
-                lastUpdate: Date.now(),
-                errorCount: (this.connectionHealth.get(symbol)?.errorCount || 0) + 1,
-                lastError: error.message
-            });
-            return false;
-        }
-    }
-
-    // 将连接加入队列
-    queueConnection(symbol) {
+    // 新增：添加到连接队列
+    addToConnectionQueue(symbol) {
         if (!this.connectionQueue.includes(symbol)) {
             this.connectionQueue.push(symbol);
-            this.stats.queuedConnections = this.connectionQueue.length;
-            console.log(`⏳ ${symbol} 加入连接队列 (队列长度: ${this.stats.queuedConnections})`);
+            console.log(`📥 ${symbol} 已加入连接队列 (当前队列长度: ${this.connectionQueue.length})`);
+            
+            // 如果没有在处理队列，立即开始处理
+            if (!this.isProcessingQueue) {
+                console.log(`🚀 自动启动连接处理...`);
+                this.processConnectionQueue();
+            }
         }
     }
 
-    // 处理连接队列
+    // 轮询式智能连接队列处理
     async processConnectionQueue() {
         if (this.isProcessingQueue || this.connectionQueue.length === 0) {
             return;
         }
 
         this.isProcessingQueue = true;
-        console.log(`🔄 开始处理连接队列，共 ${this.connectionQueue.length} 个待连接币种...`);
+        console.log(`\n🔗 开始智能连接管理，共 ${this.connectionQueue.length} 个待连接币种...`);
 
-        // 使用信号量控制并发连接数
-        const connectionSemaphore = new Semaphore(this.maxConnections);
-        const queueItems = [...this.connectionQueue]; // 复制队列，避免并发修改
-        this.connectionQueue = []; // 清空原队列
-        
-        // 并行处理队列中的连接，但控制并发数
-        const connectionPromises = queueItems.map(async (symbol) => {
-            return connectionSemaphore.acquire().then(async (release) => {
+        // 启动轮询检查器
+        this.startConnectionPolling();
+
+        let totalProcessed = 0;
+        const startTime = Date.now();
+
+        while (this.connectionQueue.length > 0) {
+            const activeConnections = this.connections.size;
+            const availableSlots = this.maxConnections - activeConnections;
+            
+            if (availableSlots <= 0) {
+                // 智能轮询检查：主动寻找可清理的连接
+                const cleanedCount = await this.pollForAvailableSlots();
+                if (cleanedCount === 0) {
+                    // 如果轮询没有找到可用槽位，智能等待
+                    const waitTime = this.calculateSmartWaitTime();
+                    console.log(`⏳ 连接池已满 (${activeConnections}/${this.maxConnections})，智能等待 ${waitTime}ms...`);
+                    await new Promise(resolve => setTimeout(resolve, waitTime));
+                    continue;
+                }
+            }
+
+            // 动态批处理大小：根据可用槽位和队列长度调整
+            const dynamicBatchSize = Math.min(
+                Math.min(10, availableSlots), // 最多10个并发
+                Math.ceil(this.connectionQueue.length / 10) // 根据队列长度调整
+            );
+            
+            const currentBatch = this.connectionQueue.splice(0, dynamicBatchSize);
+            console.log(`🚀 智能批处理 ${currentBatch.length} 个连接 (可用槽位: ${availableSlots})...`);
+
+            // 并行建立连接
+            const connectionPromises = currentBatch.map(async (symbol) => {
+                const connectionStartTime = Date.now();
                 try {
-                    const success = await this.connectSymbolWithRetry(symbol);
-                    release();
-                    return { symbol, success };
+                    await this.establishConnectionWithTimeout(symbol);
+                    const connectionTime = Date.now() - connectionStartTime;
+                    
+                    // 更新性能指标
+                    this.performanceMetrics.successfulConnections++;
+                    this.performanceMetrics.avgConnectionTime = 
+                        (this.performanceMetrics.avgConnectionTime * (this.performanceMetrics.successfulConnections - 1) + connectionTime) / 
+                        this.performanceMetrics.successfulConnections;
+                    
+                    return { symbol, success: true, connectionTime };
                 } catch (error) {
-                    release();
-                    return { symbol, success: false, error: error.message };
+                    const connectionTime = Date.now() - connectionStartTime;
+                    this.performanceMetrics.failedConnections++;
+                    
+                    console.error(`❌ ${symbol} 连接失败: ${error.message}`);
+                    return { symbol, success: false, error, connectionTime };
                 }
             });
-        });
 
-        // 等待所有连接完成
-        const results = await Promise.allSettled(connectionPromises);
-        let successCount = 0;
-        let failCount = 0;
-
-        results.forEach((result) => {
-            if (result.status === 'fulfilled') {
-                const { symbol, success } = result.value;
-                if (success) {
-                    successCount++;
-                } else {
-                    failCount++;
-                    // 如果连接失败，重新加入队列（但限制重试次数）
-                    if (retryManager.shouldRetry(symbol)) {
-                        this.queueConnection(symbol);
+            // 等待当前批次完成
+            const results = await Promise.allSettled(connectionPromises);
+            
+            // 处理结果和重试
+            results.forEach((result) => {
+                if (result.status === 'fulfilled') {
+                    const { symbol, success, error, connectionTime } = result.value;
+                    totalProcessed++;
+                    
+                    if (!success) {
+                        // 添加到重试队列
+                        this.addToRetryQueue(symbol);
+                        console.log(`🔄 ${symbol} 已加入重试队列`);
                     } else {
-                        console.error(`❌ ${symbol} 连接失败次数过多，从监控中移除`);
-                        this.removeSymbol(symbol);
+                        console.log(`✅ ${symbol} 连接成功 (${connectionTime}ms)`);
                     }
                 }
+            });
+
+            // 显示进度
+            const progress = Math.round((totalProcessed / (totalProcessed + this.connectionQueue.length)) * 100);
+            const elapsed = Math.round((Date.now() - startTime) / 1000);
+            console.log(`📈 连接进度: ${progress}% (${totalProcessed}/${totalProcessed + this.connectionQueue.length}) - 耗时 ${elapsed}s`);
+
+            // 智能延迟：根据连接成功率调整
+            const successRate = results.filter(r => r.status === 'fulfilled' && r.value.success).length / results.length;
+            const delay = successRate > 0.8 ? 100 : 500; // 成功率高时减少延迟
+            
+            await new Promise(resolve => setTimeout(resolve, delay));
+        }
+
+        const totalTime = Math.round((Date.now() - startTime) / 1000);
+        console.log(`✅ 智能连接管理完成！`);
+        console.log(`📊 连接统计: 处理 ${totalProcessed} 个，耗时 ${totalTime}s，平均速度 ${Math.round(totalProcessed / totalTime)} 个/秒`);
+        
+        this.isProcessingQueue = false;
+        this.stopConnectionPolling();
+    }
+
+    // 轮询检查可用连接槽位 - 温和释放机制
+    async pollForAvailableSlots() {
+        let cleanedCount = 0;
+        let pollAttempts = 0;
+        const maxPollAttempts = 3; // 减少轮询次数，避免过度干扰
+
+        while (pollAttempts < maxPollAttempts) {
+            pollAttempts++;
+            
+            // 检查连接状态
+            const connectionStatus = this.analyzeConnectionStatus();
+            
+            if (connectionStatus.availableSlots > 0) {
+                console.log(`🔍 轮询发现 ${connectionStatus.availableSlots} 个可用槽位！`);
+                return cleanedCount;
+            }
+
+            // 主动清理不健康的连接（CLOSED/CLOSING状态）
+            if (connectionStatus.unhealthyCount > 0) {
+                console.log(`🧹 轮询清理 ${connectionStatus.unhealthyCount} 个不健康连接...`);
+                cleanedCount += this.cleanupUnhealthyConnections();
+                
+                if (this.maxConnections - this.connections.size > 0) {
+                    console.log(`✅ 轮询清理完成，释放了 ${cleanedCount} 个连接槽位`);
+                    return cleanedCount;
+                }
+            }
+
+            // 检查是否有连接超时（更温和的超时检测）
+            if (connectionStatus.timeoutCount > 0) {
+                console.log(`⏰ 轮询发现 ${connectionStatus.timeoutCount} 个超时连接...`);
+                cleanedCount += this.cleanupTimeoutConnections();
+                
+                if (this.maxConnections - this.connections.size > 0) {
+                    console.log(`✅ 轮询清理超时连接完成，释放了 ${cleanedCount} 个连接槽位`);
+                    return cleanedCount;
+                }
+            }
+
+            // 检查是否有僵死连接（CONNECTING状态超过30秒）
+            if (connectionStatus.staleCount > 0) {
+                console.log(`💀 轮询发现 ${connectionStatus.staleCount} 个僵死连接...`);
+                cleanedCount += this.cleanupStaleConnections();
+                
+                if (this.maxConnections - this.connections.size > 0) {
+                    console.log(`✅ 轮询清理僵死连接完成，释放了 ${cleanedCount} 个连接槽位`);
+                    return cleanedCount;
+                }
+            }
+
+            // 温和等待，避免过度干扰
+            await new Promise(resolve => setTimeout(resolve, 1000));
+        }
+
+        // 如果轮询没有找到槽位，温和地释放少量连接
+        if (cleanedCount === 0) {
+            console.log(`🌱 轮询未找到槽位，温和释放少量连接...`);
+            cleanedCount = this.gentleReleaseConnections();
+        }
+        
+        return cleanedCount;
+    }
+
+    // 分析连接状态
+    analyzeConnectionStatus() {
+        let healthyCount = 0;
+        let unhealthyCount = 0;
+        let timeoutCount = 0;
+        let staleCount = 0; // 新增：僵死连接计数
+        const now = Date.now();
+
+        for (const [symbol, ws] of this.connections.entries()) {
+            if (ws.readyState === WebSocket.OPEN) {
+                // 检查连接是否超时（超过5分钟无数据）
+                if (ws.lastActivityTime && (now - ws.lastActivityTime) > 5 * 60 * 1000) {
+                    timeoutCount++;
+                } else {
+                    healthyCount++;
+                }
+            } else if (ws.readyState === WebSocket.CLOSED || ws.readyState === WebSocket.CLOSING) {
+                unhealthyCount++;
             } else {
-                failCount++;
-                console.error(`❌ 连接处理异常:`, result.reason);
+                // WebSocket.CONNECTING 状态，可能是僵死连接
+                if (ws.lastActivityTime && (now - ws.lastActivityTime) > 60 * 1000) {
+                    staleCount++;
+                } else {
+                    unhealthyCount++;
+                }
+            }
+        }
+
+        return {
+            healthyCount,
+            unhealthyCount,
+            timeoutCount,
+            staleCount,
+            availableSlots: this.maxConnections - this.connections.size
+        };
+    }
+
+    // 清理不健康的连接
+    cleanupUnhealthyConnections() {
+        let cleanedCount = 0;
+        
+        for (const [symbol, ws] of this.connections.entries()) {
+            if (ws.readyState !== WebSocket.OPEN) {
+                this.cleanupConnection(symbol);
+                cleanedCount++;
+            }
+        }
+        
+        return cleanedCount;
+    }
+
+    // 清理超时连接
+    cleanupTimeoutConnections() {
+        let cleanedCount = 0;
+        const now = Date.now();
+        const timeoutThreshold = 5 * 60 * 1000; // 恢复到5分钟超时，更温和
+
+        for (const [symbol, ws] of this.connections.entries()) {
+            if (ws.lastActivityTime && (now - ws.lastActivityTime) > timeoutThreshold) {
+                console.log(`⏰ 清理超时连接: ${symbol} (超时: ${Math.round((now - ws.lastActivityTime) / 1000)}秒)`);
+                this.cleanupConnection(symbol);
+                cleanedCount++;
+            }
+        }
+        
+        return cleanedCount;
+    }
+
+    // 清理僵死连接
+    cleanupStaleConnections() {
+        let cleanedCount = 0;
+        const now = Date.now();
+        const staleThreshold = 60 * 1000; // 60秒无活动的僵死连接，更温和
+
+        for (const [symbol, ws] of this.connections.entries()) {
+            if (ws.readyState === WebSocket.CONNECTING && 
+                ws.lastActivityTime && (now - ws.lastActivityTime) > staleThreshold) {
+                console.log(`💀 清理僵死连接: ${symbol} (僵死: ${Math.round((now - ws.lastActivityTime) / 1000)}秒)`);
+                this.cleanupConnection(symbol);
+                cleanedCount++;
+            }
+        }
+        
+        return cleanedCount;
+    }
+
+    // 清理连接
+    cleanupConnection(symbol) {
+        const ws = this.connections.get(symbol);
+        if (ws) {
+            try {
+                ws.close();
+            } catch (e) {
+                // 忽略关闭错误
+            }
+            this.connections.delete(symbol);
+            console.log(`🧹 清理连接: ${symbol}`);
+        }
+    }
+
+    // 温和释放连接 - 避免干扰TLS握手
+    gentleReleaseConnections() {
+        let releasedCount = 0;
+        const targetReleaseCount = Math.min(5, Math.floor(this.connections.size * 0.05)); // 只释放5%的连接
+        
+        console.log(`🌱 开始温和释放 ${targetReleaseCount} 个连接...`);
+        
+        // 策略1：只释放确实有问题的连接
+        const connectionsByActivity = Array.from(this.connections.entries())
+            .map(([symbol, ws]) => ({
+                symbol,
+                ws,
+                lastActivity: ws.lastActivityTime || 0,
+                isHealthy: ws.readyState === WebSocket.OPEN,
+                isConnecting: ws.readyState === WebSocket.CONNECTING
+            }))
+            .sort((a, b) => {
+                // 优先释放：僵死连接 > 超时连接 > 最旧连接
+                if (a.isConnecting && a.lastActivity < Date.now() - 60 * 1000) return -1;
+                if (b.isConnecting && b.lastActivity < Date.now() - 60 * 1000) return 1;
+                if (a.lastActivity < Date.now() - 5 * 60 * 1000) return -1;
+                if (b.lastActivity < Date.now() - 5 * 60 * 1000) return 1;
+                return a.lastActivity - b.lastActivity;
+            });
+
+        // 只释放确实有问题的连接，避免干扰正常连接
+        for (let i = 0; i < Math.min(targetReleaseCount, connectionsByActivity.length); i++) {
+            const { symbol, ws } = connectionsByActivity[i];
+            
+            // 只释放僵死连接或长时间无活动的连接
+            const isStale = ws.readyState === WebSocket.CONNECTING && 
+                           ws.lastActivityTime && (Date.now() - ws.lastActivityTime > 90 * 1000); // 90秒僵死
+            const isTimeout = ws.lastActivityTime && (Date.now() - ws.lastActivityTime > 8 * 60 * 1000); // 8分钟超时
+            
+            if (isStale || isTimeout) {
+                try {
+                    ws.close();
+                    this.connections.delete(symbol);
+                    releasedCount++;
+                    console.log(`🌱 温和释放连接: ${symbol} (${isStale ? '僵死' : '超时'})`);
+                } catch (e) {
+                    console.error(`❌ 温和释放连接失败: ${symbol}`, e.message);
+                }
+            }
+        }
+
+        console.log(`✅ 温和释放完成，共释放 ${releasedCount} 个连接`);
+        return releasedCount;
+    }
+
+    // 带超时的连接建立
+    async establishConnectionWithTimeout(symbol) {
+        return new Promise((resolve, reject) => {
+            try {
+                const ws = connectWebSocketForSymbol(symbol);
+                
+                // 设置连接超时
+                const connectionTimeout = setTimeout(() => {
+                    reject(new Error('连接超时'));
+                }, 8000);
+
+                ws.once('open', () => {
+                    clearTimeout(connectionTimeout);
+                    console.log(`🔗 ${symbol} 连接建立成功 (${this.connections.size}/${this.maxConnections})`);
+                    resolve();
+                });
+
+                ws.once('error', (error) => {
+                    clearTimeout(connectionTimeout);
+                    reject(error);
+                });
+
+            } catch (error) {
+                reject(error);
             }
         });
+    }
 
-        this.stats.queuedConnections = this.connectionQueue.length;
-        this.isProcessingQueue = false;
+    // 计算智能等待时间
+    calculateSmartWaitTime() {
+        const queueLength = this.connectionQueue.length;
+        const activeConnections = this.connections.size;
         
-        console.log(`✅ 连接队列处理完成: ${successCount} 个成功, ${failCount} 个失败`);
+        // 根据队列长度动态调整等待时间
+        if (queueLength > 200) return 300; // 队列很长，快速重试
+        if (queueLength > 100) return 500; // 队列中等，中等速度
+        if (activeConnections > this.maxConnections * 0.95) return 2000; // 接近满负荷，等待更久
+        return 1000; // 默认等待时间
+    }
+
+    // 重试队列管理
+    retryQueue = new Map(); // symbol -> { retryCount, nextRetryTime }
+
+    addToRetryQueue(symbol) {
+        const retryInfo = this.retryQueue.get(symbol) || { retryCount: 0 };
+        retryInfo.retryCount++;
         
-        if (this.connectionQueue.length > 0) {
-            console.log(`⏳ 连接队列中还有 ${this.connectionQueue.length} 个币种等待连接`);
+        if (retryInfo.retryCount <= 3) {
+            const delay = Math.min(3000 * Math.pow(2, retryInfo.retryCount - 1), 15000);
+            retryInfo.nextRetryTime = Date.now() + delay;
+            
+            this.retryQueue.set(symbol, retryInfo);
+            
+            setTimeout(() => {
+                if (this.retryQueue.has(symbol)) {
+                    this.retryQueue.delete(symbol);
+                    this.connectionQueue.unshift(symbol); // 优先处理重试的币种
+                    console.log(`🔄 ${symbol} 重试连接...`);
+                }
+            }, delay);
         } else {
-            console.log(`✅ 所有币种连接完成`);
+            console.log(`⚠️ ${symbol} 重试次数过多，暂时跳过`);
         }
     }
 
-    // 移除监控币种
+    // 轮询器管理
+    connectionPollingInterval = null;
+
+    startConnectionPolling() {
+        if (this.connectionPollingInterval) return;
+        
+        this.connectionPollingInterval = setInterval(() => {
+            if (this.connectionQueue.length > 0 && !this.isProcessingQueue) {
+                console.log(`🔍 轮询器触发：队列中有 ${this.connectionQueue.length} 个币种等待连接`);
+                this.processConnectionQueue();
+            }
+        }, 5000); // 每5秒检查一次，减少频率
+        
+        console.log(`🔄 启动连接轮询器，每5秒检查一次`);
+    }
+
+    stopConnectionPolling() {
+        if (this.connectionPollingInterval) {
+            clearInterval(this.connectionPollingInterval);
+            this.connectionPollingInterval = null;
+            console.log(`🛑 停止连接轮询器`);
+        }
+    }
+
+    // 新增：获取系统状态
+    getSystemStatus() {
+        const activeConnections = this.connections.size;
+        const queueLength = this.connectionQueue.length;
+        const totalSymbols = this.symbols.size;
+        
+        // 估算内存使用（每个币种约0.5MB）
+        const estimatedMemory = Math.round(totalSymbols * 0.5);
+        
+        return {
+            totalSymbols,
+            activeConnections,
+            maxConnections: this.maxConnections,
+            queueLength,
+            estimatedMemory: `${estimatedMemory}MB`,
+            isProcessingQueue: this.isProcessingQueue
+        };
+    }
+
+    // 新增：显示系统状态
+    showSystemStatus() {
+        const memoryUsage = process.memoryUsage();
+        const heapUsedMB = Math.round(memoryUsage.heapUsed / 1024 / 1024);
+        const heapTotalMB = Math.round(memoryUsage.heapTotal / 1024 / 1024);
+        const memoryUsagePercent = Math.round((memoryUsage.heapUsed / memoryUsage.heapTotal) * 100);
+        
+        const performanceMetrics = this.getPerformanceMetrics();
+        
+        console.log('\n' + '='.repeat(80));
+        console.log('📊 系统状态报告');
+        console.log('='.repeat(80));
+        console.log(`🪙 监控币种: ${this.symbols.size} 个`);
+        console.log(`🔗 活跃连接: ${this.connections.size}/${this.maxConnections} (${Math.round((this.connections.size / this.maxConnections) * 100)}%)`);
+        console.log(`⏳ 连接队列: ${this.connectionQueue.length} 个待处理`);
+        console.log(`🔄 重试队列: ${this.retryQueue.size} 个待重试`);
+        console.log('');
+        console.log(`💾 内存使用: ${heapUsedMB}MB/${heapTotalMB}MB (${memoryUsagePercent}%)`);
+        console.log(`⚡ 连接性能: 成功 ${performanceMetrics.successfulConnections} 个，失败 ${performanceMetrics.failedConnections} 个`);
+        console.log(`⏱️ 平均连接时间: ${Math.round(performanceMetrics.avgConnectionTime)}ms`);
+        console.log('');
+        
+        // 连接状态分布
+        let openConnections = 0;
+        let connectingConnections = 0;
+        let closingConnections = 0;
+        let closedConnections = 0;
+        
+        for (const [symbol, ws] of this.connections) {
+            switch (ws.readyState) {
+                case 0: connectingConnections++; break; // CONNECTING
+                case 1: openConnections++; break;       // OPEN
+                case 2: closingConnections++; break;    // CLOSING
+                case 3: closedConnections++; break;     // CLOSED
+            }
+        }
+        
+        console.log(`🔌 连接状态分布:`);
+        console.log(`   📡 连接中: ${connectingConnections} 个`);
+        console.log(`   ✅ 已连接: ${openConnections} 个`);
+        console.log(`   🔄 关闭中: ${closingConnections} 个`);
+        console.log(`   ❌ 已关闭: ${closedConnections} 个`);
+        
+        // 500连接支持状态
+        if (this.maxConnections >= 500) {
+            console.log('');
+            console.log(`🚀 大规模连接支持 (${this.maxConnections} 连接):`);
+            console.log(`   📦 批处理大小: ${this.batchSize} 个/批`);
+            console.log(`   ⏱️ 批次延迟: ${this.batchDelay}ms`);
+            console.log(`   🏥 健康检查: ${this.healthCheckInterval/1000}s 间隔`);
+            console.log(`   🧠 内存阈值: ${this.memoryThreshold * 100}%`);
+        }
+        
+        console.log('='.repeat(80));
+    }
+
+    // 新增：定期清理过期数据
+    startCleanupTask() {
+        // 每5分钟清理一次过期数据
+        setInterval(() => {
+            this.cleanupExpiredData();
+        }, 5 * 60 * 1000);
+    }
+
+    // 新增：清理过期数据
+    cleanupExpiredData() {
+        const now = Date.now();
+        const inactiveThreshold = 5 * 60 * 1000; // 5分钟无活动清理
+        const maxSymbols = 1000; // 最大监控币种数
+        
+        let cleanedCount = 0;
+        
+        // 清理长时间无活动的币种
+        for (const [symbol, klineManager] of this.symbols.entries()) {
+            if (now - klineManager.lastUpdateTime > inactiveThreshold) {
+                this.removeSymbol(symbol);
+                cleanedCount++;
+            }
+        }
+        
+        // 如果币种数量超过限制，清理最旧的
+        if (this.symbols.size > maxSymbols) {
+            const symbolsToRemove = this.symbols.size - maxSymbols;
+            const sortedSymbols = Array.from(this.symbols.entries())
+                .sort((a, b) => a[1].lastUpdateTime - b[1].lastUpdateTime)
+                .slice(0, symbolsToRemove);
+            
+            sortedSymbols.forEach(([symbol]) => {
+                this.removeSymbol(symbol);
+                cleanedCount++;
+            });
+        }
+        
+        if (cleanedCount > 0) {
+            console.log(`🧹 清理完成: 移除了 ${cleanedCount} 个无活动币种`);
+            // 强制垃圾回收
+            if (global.gc) {
+                global.gc();
+                console.log('♻️ 触发垃圾回收');
+            }
+        }
+    }
+
     removeSymbol(symbol) {
-        if (this.symbols.has(symbol)) {
-            // 关闭WebSocket连接
-            if (this.connections.has(symbol)) {
-                this.connections.get(symbol).terminate();
-                this.connections.delete(symbol);
-                // 更新活跃连接统计
-                this.stats.activeConnections = this.connections.size;
-            }
-            
-            // 从队列中移除
-            const queueIndex = this.connectionQueue.indexOf(symbol);
-            if (queueIndex > -1) {
-                this.connectionQueue.splice(queueIndex, 1);
-                this.stats.queuedConnections = this.connectionQueue.length;
-            }
-            
-            this.symbols.delete(symbol);
-            this.stats.totalSymbols = this.symbols.size;
-            console.log(`❌ 移除监控币种: ${symbol} (剩余: ${this.stats.totalSymbols})`);
-            
-            // 处理队列中的连接
-            this.processConnectionQueue();
-            return true;
+        // 关闭WebSocket连接
+        const connection = this.connections.get(symbol);
+        if (connection) {
+            connection.close();
+            this.connections.delete(symbol);
         }
-        return false;
+
+        // 从队列中移除
+        const queueIndex = this.connectionQueue.indexOf(symbol);
+        if (queueIndex > -1) {
+            this.connectionQueue.splice(queueIndex, 1);
+        }
+
+        // 移除K线管理器
+        this.symbols.delete(symbol);
+        console.log(`🗑️ 币种 ${symbol} 已从监控列表中移除`);
     }
 
-    // 批量移除币种
-    removeSymbols(symbols) {
-        console.log(`🔄 批量移除 ${symbols.length} 个币种...`);
-        let removedCount = 0;
-        
-        for (const symbol of symbols) {
-            if (this.removeSymbol(symbol)) {
-                removedCount++;
-            }
-        }
-        
-        console.log(`✅ 批量移除完成，成功移除 ${removedCount} 个币种`);
-        return removedCount;
-    }
-
-    // 获取所有监控的币种
     getSymbols() {
         return Array.from(this.symbols.keys());
     }
 
-    // 获取指定币种的管理器
     getKlineManager(symbol) {
         return this.symbols.get(symbol);
     }
 
-    // 设置WebSocket连接
     setConnection(symbol, ws) {
         this.connections.set(symbol, ws);
-        // 更新活跃连接统计
-        this.stats.activeConnections = this.connections.size;
     }
 
-    // 获取WebSocket连接
     getConnection(symbol) {
         return this.connections.get(symbol);
     }
 
-    // 获取统计信息
-    getStats() {
+    // 启动健康检查
+    startHealthCheck() {
+        if (this.healthCheckInterval) {
+            setInterval(() => {
+                this.performHealthCheck();
+            }, this.healthCheckInterval);
+        }
+    }
+
+    // 执行健康检查
+    performHealthCheck() {
         const memoryUsage = process.memoryUsage();
-        this.stats.memoryUsage = Math.round(memoryUsage.heapUsed / 1024 / 1024); // MB
-        
-        // 实时计算活跃连接数，确保准确性
-        this.stats.activeConnections = this.connections.size;
-        
-        // 计算连接成功率
-        const totalAttempts = this.stats.activeConnections + this.stats.failedConnections;
-        const connectionSuccessRate = totalAttempts > 0 ? 
-            ((this.stats.activeConnections / totalAttempts) * 100).toFixed(1) : 0;
-        
-        // 计算队列处理效率
-        const queueEfficiency = this.stats.queuedConnections > 0 ? 
-            ((this.stats.activeConnections / (this.stats.activeConnections + this.stats.queuedConnections)) * 100).toFixed(1) : 100;
-        
-        return {
-            ...this.stats,
-            memoryUsageMB: this.stats.memoryUsage,
-            connectionUtilization: `${this.stats.activeConnections}/${this.maxConnections}`,
-            connectionSuccessRate: `${connectionSuccessRate}%`,
-            queueEfficiency: `${queueEfficiency}%`,
-            queueLength: this.stats.queuedConnections,
-            retryCount: this.stats.retryCount,
-            failedConnections: this.stats.failedConnections,
-            // 系统资源使用情况
-            systemMemory: {
-                heapUsed: Math.round(memoryUsage.heapUsed / 1024 / 1024),
-                heapTotal: Math.round(memoryUsage.heapTotal / 1024 / 1024),
-                external: Math.round(memoryUsage.external / 1024 / 1024),
-                rss: Math.round(memoryUsage.rss / 1024 / 1024)
-            }
-        };
-    }
+        const heapUsedMB = Math.round(memoryUsage.heapUsed / 1024 / 1024);
+        const heapTotalMB = Math.round(memoryUsage.heapTotal / 1024 / 1024);
+        const memoryUsagePercent = Math.round((memoryUsage.heapUsed / memoryUsage.heapTotal) * 100);
 
-    // 清理不活跃的连接
-    cleanupInactiveConnections() {
-        const now = Date.now();
-        const inactiveThreshold = 5 * 60 * 1000; // 5分钟无活动
-        let cleanedCount = 0;
-        
-        // 保存当前监控的币种列表，避免完全清理
-        const currentSymbols = Array.from(this.symbols.keys());
-        
-        for (const [symbol, klineManager] of this.symbols.entries()) {
-            if (now - klineManager.lastUpdateTime > inactiveThreshold) {
-                console.log(`🧹 清理不活跃连接: ${symbol}`);
-                // 只清理WebSocket连接，保留币种监控
-                if (this.connections.has(symbol)) {
-                    const ws = this.connections.get(symbol);
-                    if (ws) {
-                        ws.close();
-                        this.connections.delete(symbol);
-                    }
-                    cleanedCount++;
-                }
-                // 重置最后更新时间，给币种一个重新开始的机会
-                klineManager.lastUpdateTime = now;
-            }
-        }
-        
-        if (cleanedCount > 0) {
-            // 更新活跃连接统计
-            this.stats.activeConnections = this.connections.size;
-            console.log(`🧹 清理完成，共清理 ${cleanedCount} 个不活跃连接`);
-            // 清理后立即尝试重新连接
-            this.reconnectCleanedSymbols();
-        }
-        
-        // 清理过期的重试记录
-        const retryCleanupThreshold = 30 * 60 * 1000; // 30分钟
-        for (const [symbol, retryInfo] of retryManager.retryCounts.entries()) {
-            if (!this.symbols.has(symbol)) {
-                retryManager.retryCounts.delete(symbol);
-            }
-        }
-    }
+        this.performanceMetrics.memoryUsage = memoryUsagePercent;
 
-    // 重新连接被清理的币种
-    async reconnectCleanedSymbols() {
-        const symbolsToReconnect = Array.from(this.symbols.keys()).filter(symbol => 
-            !this.connections.has(symbol) || 
-            !this.connections.get(symbol) || 
-            this.connections.get(symbol).readyState !== WebSocket.OPEN
-        );
-        
-        if (symbolsToReconnect.length > 0) {
-            console.log(`🔄 尝试重新连接 ${symbolsToReconnect.length} 个币种...`);
-            
-            // 分批重新连接，避免同时建立过多连接
-            const batchSize = 10;
-            for (let i = 0; i < symbolsToReconnect.length; i += batchSize) {
-                const batch = symbolsToReconnect.slice(i, i + batchSize);
-                const promises = batch.map(symbol => this.connectSymbol(symbol));
-                
-                try {
-                    await Promise.allSettled(promises);
-                    console.log(`✅ 批次 ${Math.floor(i/batchSize) + 1} 重新连接完成`);
-                } catch (error) {
-                    console.error(`❌ 批次 ${Math.floor(i/batchSize) + 1} 重新连接失败:`, error.message);
-                }
-                
-                // 批次间延迟
-                if (i + batchSize < symbolsToReconnect.length) {
-                    await new Promise(resolve => setTimeout(resolve, 1000));
-                }
-            }
-        }
-    }
+        // 检查连接健康状态
+        let healthyConnections = 0;
+        let unhealthyConnections = 0;
+        let totalConnections = this.connections.size;
 
-    // 优化内存使用
-    optimizeMemory() {
-        let optimizedCount = 0;
-        
-        // 清理过期的历史数据
-        for (const klineManager of this.symbols.values()) {
-            if (klineManager.klines.length > CONFIG.historyLimit) {
-                const removedCount = klineManager.klines.length - CONFIG.historyLimit;
-                klineManager.klines = klineManager.klines.slice(-CONFIG.historyLimit);
-                optimizedCount += removedCount;
-            }
-            
-            // 清理过期的成交量历史
-            if (klineManager.volumeHistory.length > 20) {
-                klineManager.volumeHistory = klineManager.volumeHistory.slice(-20);
-            }
-            
-            // 清理过期的警报历史
-            if (klineManager.alertHistory.length > 10) {
-                klineManager.alertHistory = klineManager.alertHistory.slice(-10);
-            }
-        }
-        
-        // 清理过期的消息去重缓存
-        const now = Date.now();
-        for (const [hash, timestamp] of messageDeduplicationCache.entries()) {
-            if (now - timestamp > DEDUPLICATION_WINDOW) {
-                messageDeduplicationCache.delete(hash);
-            }
-        }
-        
-        // 强制垃圾回收
-        if (global.gc) {
-            global.gc();
-        }
-        
-        if (optimizedCount > 0) {
-            console.log(`🧹 内存优化完成，清理了 ${optimizedCount} 条过期数据`);
-        }
-    }
-
-    // 连接健康检查
-    async checkConnectionHealth() {
-        const healthReport = {
-            totalSymbols: this.symbols.size,
-            activeConnections: 0,
-            brokenConnections: 0,
-            queuedConnections: this.connectionQueue.length,
-            memoryUsage: this.getStats().memoryUsageMB,
-            timestamp: new Date().toISOString()
-        };
-
-        for (const [symbol, ws] of this.connections.entries()) {
-            if (ws && ws.readyState === WebSocket.OPEN) {
-                healthReport.activeConnections++;
+        for (const [symbol, ws] of this.connections) {
+            if (ws.readyState === 1) { // OPEN状态
+                healthyConnections++;
             } else {
-                healthReport.brokenConnections++;
-                // 标记为需要重连
-                if (this.symbols.has(symbol)) {
-                    console.log(`⚠️ 检测到断开的连接: ${symbol}`);
-                    this.queueConnection(symbol);
-                }
+                unhealthyConnections++;
             }
         }
 
-        // 更新统计信息
-        this.stats.activeConnections = healthReport.activeConnections;
-        
-        return healthReport;
+        // 如果内存使用过高，触发垃圾回收
+        if (memoryUsagePercent > 85) {
+            console.log(`⚠️ 内存使用过高 (${memoryUsagePercent}%)，触发垃圾回收...`);
+            if (global.gc) {
+                global.gc();
+                console.log(`🧹 垃圾回收完成`);
+            }
+        }
+
+        // 如果连接池使用率过高，考虑清理
+        const connectionUsagePercent = Math.round((totalConnections / this.maxConnections) * 100);
+        if (connectionUsagePercent > 90) {
+            console.log(`⚠️ 连接池使用率过高 (${connectionUsagePercent}%)，考虑清理...`);
+            this.cleanupUnhealthyConnections();
+        }
+
+        // 记录健康状态
+        console.log(`🏥 健康检查: 内存 ${heapUsedMB}MB/${heapTotalMB}MB (${memoryUsagePercent}%) | 连接 ${healthyConnections}/${totalConnections} (${connectionUsagePercent}%)`);
     }
 
-    // 获取连接状态摘要
-    getConnectionStatus() {
-        const stats = this.getStats();
-        const health = this.checkConnectionHealth();
-        
+    // 获取性能指标
+    getPerformanceMetrics() {
         return {
-            summary: {
-                totalSymbols: stats.totalSymbols,
-                activeConnections: stats.activeConnections,
-                queuedConnections: stats.queuedConnections,
-                connectionUtilization: stats.connectionUtilization,
-                connectionSuccessRate: stats.connectionSuccessRate,
-                queueEfficiency: stats.queueEfficiency
-            },
-            memory: stats.systemMemory,
-            performance: {
-                failedConnections: stats.failedConnections,
-                retryCount: stats.retryCount,
-                memoryUsageMB: stats.memoryUsageMB
-            },
-            timestamp: new Date().toISOString()
+            ...this.performanceMetrics,
+            connectionPoolUsage: Math.round((this.connections.size / this.maxConnections) * 100),
+            queueLength: this.connectionQueue.length,
+            activeConnections: this.connections.size
         };
     }
 }
@@ -1872,914 +1681,270 @@ class MultiSymbolKlineManager {
 // 单个币种的K线管理器
 class KlineManager {
     constructor(maxLength = 30, symbol = '') {
+        this.maxLength = maxLength;
         this.symbol = symbol;
         this.klines = [];
-        this.maxLength = maxLength;
+        this.buyVolumes = []; // 新增：存储买入量数据
         this.isInitialized = false;
         this.lastUpdateTime = 0;
-        
-        // 新增：趋势分析相关属性
-        this.volumeHistory = []; // 记录最近10根K线的成交量变化
-        this.alertHistory = []; // 记录最近5次警报情况
-        this.consecutiveAbnormalCount = 0; // 连续异常次数
-        this.lastAbnormalType = null; // 上次异常类型
-        this.trendStrength = 0; // 趋势强度 (0-100)
     }
 
-    // 添加新的K线数据并维护滑动窗口
     addKline(klineData) {
-        // 检查是否是重复数据
+        // 检查是否已经存在相同时间戳的K线，防止重复添加
         if (this.klines.length > 0) {
             const lastKline = this.klines[this.klines.length - 1];
-            if (lastKline.openTime === klineData.openTime) {
-                // 更新最后一根K线数据（实时更新）
-                this.klines[this.klines.length - 1] = klineData;
-                // 更新买入量历史（实时更新）
-                if (klineData.buyVolume !== undefined) {
-                    this.updateVolumeHistory(klineData.buyVolume);
+            if (lastKline.closeTime === klineData.closeTime) {
+                // 如果时间戳相同，更新现有K线数据而不是添加新的
+                lastKline.open = klineData.open;
+                lastKline.high = klineData.high;
+                lastKline.low = klineData.low;
+                lastKline.close = klineData.close;
+                lastKline.volume = klineData.volume;
+                lastKline.quoteVolume = klineData.quoteVolume;
+                lastKline.trades = klineData.trades;
+                lastKline.isCompleted = klineData.isCompleted;
+                lastKline.buyVolume = klineData.buyVolume;
+                lastKline.buyQuoteVolume = klineData.buyQuoteVolume;
+                
+                // 更新买入量数据
+                if (this.buyVolumes.length > 0) {
+                    this.buyVolumes[this.buyVolumes.length - 1] = klineData.buyVolume || klineData.volume;
                 }
-                return;
+                
+                this.lastUpdateTime = Date.now();
+                return; // 不添加新K线，直接返回
             }
         }
-
-        // 添加新的K线
+        
+        // 添加新的K线数据
         this.klines.push(klineData);
         
-        // 维护滑动窗口：保持最新的30根K线
-        while (this.klines.length > this.maxLength) {
-            this.klines.shift(); // 移除最旧的K线
-        }
-
-        // 更新买入量历史
+        // 添加买入量数据（如果有的话）
         if (klineData.buyVolume !== undefined) {
-            this.updateVolumeHistory(klineData.buyVolume);
+            this.buyVolumes.push(klineData.buyVolume);
+        } else if (klineData.volume !== undefined) {
+            // 如果没有买入量数据，使用总成交量作为备选
+            this.buyVolumes.push(klineData.volume);
         }
-
+        
+        // 限制数组长度
+        if (this.klines.length > this.maxLength) {
+            this.klines.shift();
+        }
+        if (this.buyVolumes.length > this.maxLength) {
+            this.buyVolumes.shift();
+        }
+        
+        // 标记为已初始化
+        if (this.klines.length >= 5) {
+            this.isInitialized = true;
+        }
+        
         this.lastUpdateTime = Date.now();
     }
 
-    // 新增：更新成交量历史记录
-    updateVolumeHistory(currentBuyVolume) {
-        this.volumeHistory.push({
-            volume: currentBuyVolume,
-            timestamp: Date.now()
-        });
+    // 计算平均买入量
+    calculateAverageBuyVolume() {
+        if (this.buyVolumes.length === 0) return 0;
         
-        // 只保留最近10根K线的记录
-        if (this.volumeHistory.length > 10) {
-            this.volumeHistory.shift();
-        }
+        const sum = this.buyVolumes.reduce((acc, volume) => acc + volume, 0);
+        return sum / this.buyVolumes.length;
     }
 
-    // 重新设计：分析买入量趋势 - 智能版本
-    analyzeVolumeTrend() {
-        if (this.volumeHistory.length < 3) {
-            return { 
-                trend: 'insufficient', 
-                strength: 0,
-                reason: `数据不足 (${this.volumeHistory.length}/3) - 需要至少3根K线数据`,
-                details: {
-                    volumeHistoryLength: this.volumeHistory.length,
-                    requiredLength: 3,
-                    recentVolumes: this.volumeHistory.map(v => v.volume)
-                }
-            };
-        }
-
-        // 获取最近10根K线的买入量数据
-        const recentVolumes = this.volumeHistory.slice(-10).map(v => v.volume);
-        
-        // 1. 短期买入量趋势分析 (最近3根K线)
-        const shortTermVolumes = recentVolumes.slice(-3);
-        const shortTermTrend = this.calculateTrendDirection(shortTermVolumes, '短期');
-        
-        // 2. 中期买入量趋势分析 (最近5根K线)
-        const mediumTermVolumes = recentVolumes.slice(-5);
-        const mediumTermTrend = this.calculateTrendDirection(mediumTermVolumes, '中期');
-        
-        // 3. 长期买入量趋势分析 (最近10根K线)
-        const longTermTrend = this.calculateTrendDirection(recentVolumes, '长期');
-        
-        // 4. 综合买入量趋势判断
-        const comprehensiveTrend = this.combineTrendAnalysis(shortTermTrend, mediumTermTrend, longTermTrend);
-        
-        return comprehensiveTrend;
-    }
-
-    // 计算买入量趋势方向
-    calculateTrendDirection(volumes, period) {
-        if (volumes.length < 2) {
-            return { trend: 'insufficient', strength: 0, reason: '数据不足' };
-        }
-
-        let increasingCount = 0;
-        let decreasingCount = 0;
-        let totalChange = 0;
-        let consecutiveIncreases = 0;
-        let consecutiveDecreases = 0;
-        let maxConsecutiveIncreases = 0;
-        let maxConsecutiveDecreases = 0;
-
-        for (let i = 1; i < volumes.length; i++) {
-            const change = volumes[i] - volumes[i-1];
-            totalChange += change;
-            
-            if (change > 0) {
-                increasingCount++;
-                consecutiveIncreases++;
-                consecutiveDecreases = 0;
-                maxConsecutiveIncreases = Math.max(maxConsecutiveIncreases, consecutiveIncreases);
-            } else if (change < 0) {
-                decreasingCount++;
-                consecutiveDecreases++;
-                consecutiveIncreases = 0;
-                maxConsecutiveDecreases = Math.max(maxConsecutiveDecreases, consecutiveDecreases);
-            } else {
-                consecutiveIncreases = 0;
-                consecutiveDecreases = 0;
-            }
-        }
-
-        // 计算平均变化率
-        const avgChange = totalChange / (volumes.length - 1);
-        const avgBuyVolume = volumes.reduce((a, b) => a + b, 0) / volumes.length;
-        const changeRate = avgBuyVolume > 0 ? Math.abs(avgChange) / avgBuyVolume * 100 : 0;
-
-        // 计算买入量趋势一致性
-        const trendConsistency = Math.max(increasingCount, decreasingCount) / (volumes.length - 1) * 100;
-        
-        // 计算连续买入量趋势强度
-        const consecutiveStrength = Math.max(maxConsecutiveIncreases, maxConsecutiveDecreases) / (volumes.length - 1) * 100;
-        
-        // 综合买入量强度计算
-        const combinedStrength = Math.min(
-            trendConsistency * 0.4 + 
-            consecutiveStrength * 0.3 + 
-            changeRate * 0.3, 
-            100
-        );
-
-        let trend = 'stable';
-        let reason = '趋势稳定';
-        
-        if (increasingCount > decreasingCount && combinedStrength > 30) {
-            trend = 'increasing';
-            reason = `${period}上升趋势 (${increasingCount}/${volumes.length-1}次增长, 连续${maxConsecutiveIncreases}次, 强度:${combinedStrength.toFixed(1)}%)`;
-        } else if (decreasingCount > increasingCount && combinedStrength > 30) {
-            trend = 'decreasing';
-            reason = `${period}下降趋势 (${decreasingCount}/${volumes.length-1}次下降, 连续${maxConsecutiveDecreases}次, 强度:${combinedStrength.toFixed(1)}%)`;
-        } else if (combinedStrength > 20) {
-            trend = 'volatile';
-            reason = `${period}波动趋势 (强度:${combinedStrength.toFixed(1)}%, 变化率:${changeRate.toFixed(2)}%)`;
-        } else {
-            reason = `${period}稳定趋势 (强度:${combinedStrength.toFixed(1)}%, 变化率:${changeRate.toFixed(2)}%)`;
-        }
-
-        return {
-            trend,
-            strength: combinedStrength,
-            reason,
-            period,
-            details: {
-                increasingCount,
-                decreasingCount,
-                maxConsecutiveIncreases,
-                maxConsecutiveDecreases,
-                avgChange,
-                changeRate: changeRate.toFixed(2),
-                trendConsistency: trendConsistency.toFixed(1),
-                consecutiveStrength: consecutiveStrength.toFixed(1)
-            }
-        };
-    }
-
-    // 综合趋势分析
-    combineTrendAnalysis(shortTerm, mediumTerm, longTerm) {
-        // 权重分配：短期40%，中期35%，长期25%
-        const shortWeight = 0.4;
-        const mediumWeight = 0.35;
-        const longWeight = 0.25;
-
-        // 计算加权平均强度
-        const weightedStrength = (
-            shortTerm.strength * shortWeight +
-            mediumTerm.strength * mediumWeight +
-            longTerm.strength * longWeight
-        );
-
-        // 趋势一致性判断
-        const trends = [shortTerm.trend, mediumTerm.trend, longTerm.trend];
-        const trendCounts = {
-            increasing: trends.filter(t => t === 'increasing').length,
-            decreasing: trends.filter(t => t === 'decreasing').length,
-            volatile: trends.filter(t => t === 'volatile').length,
-            stable: trends.filter(t => t === 'stable').length
-        };
-
-        // 确定主导趋势
-        let dominantTrend = 'stable';
-        let trendReason = '';
-
-        if (trendCounts.increasing >= 2) {
-            dominantTrend = 'increasing';
-            trendReason = `强势上升 (短期:${shortTerm.trend}, 中期:${mediumTerm.trend}, 长期:${longTerm.trend})`;
-        } else if (trendCounts.decreasing >= 2) {
-            dominantTrend = 'decreasing';
-            trendReason = `强势下降 (短期:${shortTerm.trend}, 中期:${mediumTerm.trend}, 长期:${longTerm.trend})`;
-        } else if (trendCounts.volatile >= 2) {
-            dominantTrend = 'volatile';
-            trendReason = `高波动性 (短期:${shortTerm.trend}, 中期:${mediumTerm.trend}, 长期:${longTerm.trend})`;
-        } else if (trendCounts.stable >= 2) {
-            dominantTrend = 'stable';
-            trendReason = `趋势稳定 (短期:${shortTerm.trend}, 中期:${mediumTerm.trend}, 长期:${longTerm.trend})`;
-        } else {
-            // 趋势不一致，根据强度判断
-            if (weightedStrength > 40) {
-                dominantTrend = 'mixed';
-                trendReason = `趋势分化 (强度:${weightedStrength.toFixed(1)}%, 短期:${shortTerm.trend}, 中期:${mediumTerm.trend}, 长期:${longTerm.trend})`;
-            } else {
-                dominantTrend = 'stable';
-                trendReason = `趋势不明显 (强度:${weightedStrength.toFixed(1)}%)`;
-            }
-        }
-
-        return {
-            trend: dominantTrend,
-            strength: weightedStrength,
-            reason: trendReason,
-            details: {
-                shortTerm: shortTerm,
-                mediumTerm: mediumTerm,
-                longTerm: longTerm,
-                trendCounts: trendCounts,
-                weightedStrength: weightedStrength.toFixed(1)
-            }
-        };
-    }
-
-    // 重新设计：异常趋势分析 - 只关注放量异常
-    checkConsecutiveAbnormal(volumeLevel, percentageChange) {
-        const currentTime = Date.now();
-        const isAbnormal = Math.abs(percentageChange) > 30;
-        const isSurge = percentageChange > 30; // 只关注放量异常
-        const currentType = percentageChange > 0 ? 'surge' : 'shrink';
-        const abnormalIntensity = Math.abs(percentageChange);
-        
-        // 只记录放量异常历史
-        if (isAbnormal && isSurge) {
-            this.abnormalHistory = this.abnormalHistory || [];
-            this.abnormalHistory.push({
-                timestamp: currentTime,
-                type: currentType,
-                intensity: abnormalIntensity,
-                percentageChange: percentageChange,
-                volumeLevel: volumeLevel
-            });
-            
-            // 只保留最近10次异常记录
-            if (this.abnormalHistory.length > 10) {
-                this.abnormalHistory.shift();
-            }
-        }
-        
-        // 分析异常趋势（只针对放量异常）
-        const trendAnalysis = this.analyzeAbnormalTrend();
-        
-        // 更新连续异常计数（只计算放量异常）
-        if (isAbnormal && isSurge) {
-            if (this.lastAbnormalType === 'surge') {
-                this.consecutiveAbnormalCount++;
-            } else {
-                this.consecutiveAbnormalCount = 1;
-                this.lastAbnormalType = 'surge';
-            }
-        } else {
-            // 如果是缩量异常，重置计数
-            this.consecutiveAbnormalCount = 0;
-            this.lastAbnormalType = null;
-        }
-
-        return {
-            consecutiveCount: this.consecutiveAbnormalCount,
-            type: this.lastAbnormalType,
-            isConsecutive: this.consecutiveAbnormalCount >= 2,
-            trendAnalysis: trendAnalysis,
-            currentIntensity: abnormalIntensity,
-            abnormalHistory: this.abnormalHistory || [],
-            isSurge: isSurge // 新增：标识是否为放量异常
-        };
-    }
-
-    // 新增：异常趋势分析
-    analyzeAbnormalTrend() {
-        if (!this.abnormalHistory || this.abnormalHistory.length < 2) {
+    // 获取买入量统计信息
+    getBuyVolumeStats() {
+        if (this.buyVolumes.length === 0) {
             return {
-                trend: 'insufficient',
-                strength: 0,
-                pattern: 'none',
-                reason: '异常历史数据不足',
-                details: {
-                    abnormalCount: this.abnormalHistory ? this.abnormalHistory.length : 0,
-                    requiredCount: 2
-                }
-            };
-        }
-
-        const recentAbnormals = this.abnormalHistory.slice(-5); // 最近5次异常
-        const currentTime = Date.now();
-        
-        // 1. 异常强度趋势分析
-        const intensityTrend = this.analyzeIntensityTrend(recentAbnormals);
-        
-        // 2. 异常频率分析
-        const frequencyAnalysis = this.analyzeAbnormalFrequency(recentAbnormals, currentTime);
-        
-        // 3. 异常模式识别
-        const patternAnalysis = this.analyzeAbnormalPattern(recentAbnormals);
-        
-        // 4. 时间序列分析
-        const timeSeriesAnalysis = this.analyzeTimeSeries(recentAbnormals);
-        
-        // 5. 综合趋势判断
-        const comprehensiveTrend = this.combineAbnormalTrends(
-            intensityTrend, 
-            frequencyAnalysis, 
-            patternAnalysis, 
-            timeSeriesAnalysis
-        );
-        
-        return comprehensiveTrend;
-    }
-
-    // 异常强度趋势分析
-    analyzeIntensityTrend(abnormals) {
-        if (abnormals.length < 2) return { trend: 'insufficient', strength: 0 };
-        
-        const intensities = abnormals.map(a => a.intensity);
-        let increasingCount = 0;
-        let decreasingCount = 0;
-        let totalChange = 0;
-        
-        for (let i = 1; i < intensities.length; i++) {
-            const change = intensities[i] - intensities[i-1];
-            totalChange += change;
-            if (change > 0) increasingCount++;
-            else if (change < 0) decreasingCount++;
-        }
-        
-        const avgChange = totalChange / (intensities.length - 1);
-        const trendStrength = Math.abs(avgChange) / (Math.max(...intensities) * 0.1); // 相对强度
-        
-        let trend = 'stable';
-        if (increasingCount > decreasingCount && trendStrength > 0.3) {
-            trend = 'intensifying';
-        } else if (decreasingCount > increasingCount && trendStrength > 0.3) {
-            trend = 'weakening';
-        }
-        
-        return {
-            trend: trend,
-            strength: Math.min(trendStrength * 100, 100),
-            avgChange: avgChange,
-            increasingCount: increasingCount,
-            decreasingCount: decreasingCount
-        };
-    }
-
-    // 异常频率分析
-    analyzeAbnormalFrequency(abnormals, currentTime) {
-        if (abnormals.length < 2) return { frequency: 'low', score: 0 };
-        
-        const timeIntervals = [];
-        for (let i = 1; i < abnormals.length; i++) {
-            const interval = abnormals[i].timestamp - abnormals[i-1].timestamp;
-            timeIntervals.push(interval);
-        }
-        
-        const avgInterval = timeIntervals.reduce((a, b) => a + b, 0) / timeIntervals.length;
-        const recentInterval = currentTime - abnormals[abnormals.length - 1].timestamp;
-        
-        // 频率评分：间隔越短，频率越高
-        const frequencyScore = Math.max(0, 100 - (avgInterval / 60000)); // 基于分钟计算
-        
-        let frequency = 'low';
-        if (frequencyScore > 70) frequency = 'very_high';
-        else if (frequencyScore > 50) frequency = 'high';
-        else if (frequencyScore > 30) frequency = 'medium';
-        
-        return {
-            frequency: frequency,
-            score: frequencyScore,
-            avgInterval: avgInterval / 60000, // 转换为分钟
-            recentInterval: recentInterval / 60000
-        };
-    }
-
-    // 异常模式识别
-    analyzeAbnormalPattern(abnormals) {
-        if (abnormals.length < 3) return { pattern: 'none', confidence: 0 };
-        
-        const types = abnormals.map(a => a.type);
-        const intensities = abnormals.map(a => a.intensity);
-        
-        // 模式1：连续同类型异常
-        let consecutiveSameType = 1;
-        for (let i = types.length - 1; i > 0; i--) {
-            if (types[i] === types[i-1]) consecutiveSameType++;
-            else break;
-        }
-        
-        // 模式2：交替异常
-        let alternatingCount = 0;
-        for (let i = 1; i < types.length; i++) {
-            if (types[i] !== types[i-1]) alternatingCount++;
-        }
-        
-        // 模式3：强度递增/递减
-        let intensityPattern = 'stable';
-        let intensityConsistency = 0;
-        for (let i = 1; i < intensities.length; i++) {
-            if (intensities[i] > intensities[i-1]) intensityConsistency++;
-            else if (intensities[i] < intensities[i-1]) intensityConsistency--;
-        }
-        
-        if (intensityConsistency > 0) intensityPattern = 'increasing';
-        else if (intensityConsistency < 0) intensityPattern = 'decreasing';
-        
-        // 确定主导模式
-        let pattern = 'random';
-        let confidence = 0;
-        
-        if (consecutiveSameType >= 3) {
-            pattern = 'consecutive_same';
-            confidence = Math.min(consecutiveSameType * 25, 100);
-        } else if (alternatingCount >= types.length - 1) {
-            pattern = 'alternating';
-            confidence = Math.min(alternatingCount * 20, 100);
-        } else if (Math.abs(intensityConsistency) >= intensities.length - 1) {
-            pattern = intensityPattern;
-            confidence = Math.min(Math.abs(intensityConsistency) * 20, 100);
-        }
-        
-        return {
-            pattern: pattern,
-            confidence: confidence,
-            consecutiveSameType: consecutiveSameType,
-            alternatingCount: alternatingCount,
-            intensityPattern: intensityPattern
-        };
-    }
-
-    // 时间序列分析
-    analyzeTimeSeries(abnormals) {
-        if (abnormals.length < 3) return { trend: 'insufficient', volatility: 0 };
-        
-        const timestamps = abnormals.map(a => a.timestamp);
-        const intensities = abnormals.map(a => a.intensity);
-        
-        // 计算时间间隔的变异系数
-        const intervals = [];
-        for (let i = 1; i < timestamps.length; i++) {
-            intervals.push(timestamps[i] - timestamps[i-1]);
-        }
-        
-        const avgInterval = intervals.reduce((a, b) => a + b, 0) / intervals.length;
-        const intervalVariance = intervals.reduce((sum, interval) => {
-            return sum + Math.pow(interval - avgInterval, 2);
-        }, 0) / intervals.length;
-        const intervalStdDev = Math.sqrt(intervalVariance);
-        const intervalCV = intervalStdDev / avgInterval; // 变异系数
-        
-        // 计算强度的时间趋势
-        const timeTrend = this.calculateTimeTrend(timestamps, intensities);
-        
-        return {
-            trend: timeTrend.trend,
-            volatility: Math.min(intervalCV * 100, 100),
-            avgInterval: avgInterval / 60000, // 分钟
-            intervalCV: intervalCV,
-            timeSlope: timeTrend.slope
-        };
-    }
-
-    // 计算时间趋势
-    calculateTimeTrend(timestamps, values) {
-        const n = timestamps.length;
-        let sumX = 0, sumY = 0, sumXY = 0, sumX2 = 0;
-        
-        for (let i = 0; i < n; i++) {
-            sumX += timestamps[i];
-            sumY += values[i];
-            sumXY += timestamps[i] * values[i];
-            sumX2 += timestamps[i] * timestamps[i];
-        }
-        
-        const slope = (n * sumXY - sumX * sumY) / (n * sumX2 - sumX * sumX);
-        const trend = slope > 0.0001 ? 'increasing' : slope < -0.0001 ? 'decreasing' : 'stable';
-        
-        return { trend, slope };
-    }
-
-    // 综合异常趋势分析
-    combineAbnormalTrends(intensityTrend, frequencyAnalysis, patternAnalysis, timeSeriesAnalysis) {
-        // 权重分配
-        const weights = {
-            intensity: 0.35,
-            frequency: 0.25,
-            pattern: 0.25,
-            timeSeries: 0.15
-        };
-        
-        // 计算综合强度
-        const combinedStrength = (
-            intensityTrend.strength * weights.intensity +
-            frequencyAnalysis.score * weights.frequency +
-            patternAnalysis.confidence * weights.pattern +
-            (100 - timeSeriesAnalysis.volatility) * weights.timeSeries
-        );
-        
-        // 确定主导趋势
-        let dominantTrend = 'stable';
-        let trendReason = '';
-        
-        if (intensityTrend.trend === 'intensifying' && combinedStrength > 60) {
-            dominantTrend = 'intensifying';
-            trendReason = `异常强度递增趋势 (强度:${intensityTrend.strength.toFixed(1)}%, 频率:${frequencyAnalysis.frequency})`;
-        } else if (intensityTrend.trend === 'weakening' && combinedStrength > 60) {
-            dominantTrend = 'weakening';
-            trendReason = `异常强度递减趋势 (强度:${intensityTrend.strength.toFixed(1)}%, 频率:${frequencyAnalysis.frequency})`;
-        } else if (frequencyAnalysis.frequency === 'very_high' && combinedStrength > 50) {
-            dominantTrend = 'high_frequency';
-            trendReason = `高频异常模式 (频率:${frequencyAnalysis.score.toFixed(1)}%, 模式:${patternAnalysis.pattern})`;
-        } else if (patternAnalysis.pattern !== 'random' && patternAnalysis.confidence > 60) {
-            dominantTrend = 'patterned';
-            trendReason = `规律性异常模式 (模式:${patternAnalysis.pattern}, 置信度:${patternAnalysis.confidence.toFixed(1)}%)`;
-        } else if (combinedStrength > 40) {
-            dominantTrend = 'moderate';
-            trendReason = `中等异常趋势 (综合强度:${combinedStrength.toFixed(1)}%)`;
-        } else {
-            trendReason = `异常趋势不明显 (综合强度:${combinedStrength.toFixed(1)}%)`;
-        }
-        
-        return {
-            trend: dominantTrend,
-            strength: combinedStrength,
-            reason: trendReason,
-            details: {
-                intensityTrend: intensityTrend,
-                frequencyAnalysis: frequencyAnalysis,
-                patternAnalysis: patternAnalysis,
-                timeSeriesAnalysis: timeSeriesAnalysis,
-                weights: weights
-            }
-        };
-    }
-
-    // 新增：噪音过滤 - 智能阈值调整
-    getDynamicThreshold() {
-        const baseThreshold = 30;
-        
-        // 根据连续异常次数调整阈值
-        if (this.consecutiveAbnormalCount >= 3) {
-            return baseThreshold * 0.8; // 降低阈值，更容易触发警报
-        } else if (this.consecutiveAbnormalCount === 0) {
-            return baseThreshold * 1.2; // 提高阈值，减少噪音
-        }
-        
-        return baseThreshold;
-    }
-
-    // 新增：综合趋势分析 - 只推送放量异常
-    analyzeComprehensiveTrend(currentBuyVolume) {
-        // 先更新买入量历史，确保趋势分析有足够数据
-        this.updateVolumeHistory(currentBuyVolume);
-        
-        const basicAnalysis = this.analyzeVolume(currentBuyVolume);
-        const volumeTrend = this.analyzeVolumeTrend();
-        const consecutiveInfo = this.checkConsecutiveAbnormal(basicAnalysis.volumeLevel, basicAnalysis.percentageChange);
-        const dynamicThreshold = this.getDynamicThreshold();
-        
-        // 计算综合评分
-        let confidenceScore = 0;
-        let shouldAlert = false;
-        
-        // 基础异常判断 - 只关注买入量放量异常
-        const isBasicAbnormal = basicAnalysis.percentageChange > dynamicThreshold; // 只检查正数（放量）
-        
-        // 新增：200%以上极端买入量放量立即推送
-        const isExtremeSurge = basicAnalysis.percentageChange > 200;
-        
-        if (isExtremeSurge) {
-            // 极端买入量放量（200%以上）立即推送，不需要连续异常判断
-            shouldAlert = true;
-            confidenceScore = 100; // 给予最高评分
-        } else if (isBasicAbnormal) {
-            confidenceScore += 30;
-            
-            // 连续异常加分 - 重点考虑连续买入量放量异常
-            if (consecutiveInfo.isConsecutive) {
-                confidenceScore += consecutiveInfo.consecutiveCount * 25; // 增加连续异常的权重
-            }
-            
-            // 新增：买入量异常趋势分析加分
-            if (consecutiveInfo.trendAnalysis && consecutiveInfo.trendAnalysis.trend !== 'insufficient') {
-                const trendAnalysis = consecutiveInfo.trendAnalysis;
-                
-                // 根据买入量异常趋势类型加分
-                switch (trendAnalysis.trend) {
-                    case 'intensifying':
-                        confidenceScore += 30; // 买入量异常强度递增，重点关注
-                        break;
-                    case 'high_frequency':
-                        confidenceScore += 25; // 高频买入量异常，需要关注
-                        break;
-                    case 'patterned':
-                        confidenceScore += 20; // 规律性买入量异常
-                        break;
-                    case 'moderate':
-                        confidenceScore += 15; // 中等买入量异常趋势
-                        break;
-                    case 'weakening':
-                        confidenceScore += 10; // 买入量异常强度递减
-                        break;
-                }
-                
-                // 根据买入量趋势强度额外加分
-                if (trendAnalysis.strength > 70) {
-                    confidenceScore += 15;
-                } else if (trendAnalysis.strength > 50) {
-                    confidenceScore += 10;
-                } else if (trendAnalysis.strength > 30) {
-                    confidenceScore += 5;
-                }
-            }
-            
-                    // 买入量趋势一致性加分 - 只关注上升趋势
-        if (volumeTrend.trend === 'increasing' && basicAnalysis.percentageChange > 0) {
-            confidenceScore += 15;
-        } else if (volumeTrend.trend === 'volatile' && basicAnalysis.percentageChange > 50) {
-            confidenceScore += 10;
-        }
-        
-        // 买入量趋势强度加分
-        if (volumeTrend.strength > 0) {
-            confidenceScore += Math.min(volumeTrend.strength * 0.3, 20);
-        }
-            
-            // 历史数据充分性加分
-            if (basicAnalysis.historicalCount >= 20) {
-                confidenceScore += 10;
-            }
-            
-            // 关键修改：基于买入量异常趋势分析的智能警报判断 - 只推送放量异常
-            const hasStrongTrend = consecutiveInfo.trendAnalysis && 
-                                 consecutiveInfo.trendAnalysis.trend !== 'insufficient' && 
-                                 consecutiveInfo.trendAnalysis.strength > 50;
-            
-            const hasConsecutiveAbnormal = consecutiveInfo.consecutiveCount >= 2;
-            
-            // 新的警报逻辑：需要连续买入量放量异常 + 强趋势 或 高综合评分
-            shouldAlert = (hasConsecutiveAbnormal && hasStrongTrend) || 
-                         (consecutiveInfo.consecutiveCount >= 3 && confidenceScore >= 60) ||
-                         (consecutiveInfo.consecutiveCount >= 2 && confidenceScore >= 80);
-        }
-
-        return {
-            ...basicAnalysis,
-            volumeTrend: volumeTrend,
-            consecutiveInfo: consecutiveInfo,
-            dynamicThreshold: dynamicThreshold,
-            confidenceScore: Math.min(confidenceScore, 100),
-            shouldAlert: shouldAlert,
-            trendStrength: volumeTrend.strength,
-            trendReason: volumeTrend.reason,
-            abnormalTrendAnalysis: consecutiveInfo.trendAnalysis,
-            isSurgeAlert: shouldAlert, // 新增：标识是否为放量警报
-            isExtremeSurge: isExtremeSurge // 新增：标识是否为极端放量（200%以上）
-        };
-    }
-
-    // 计算当前30根K线的平均成交量
-    calculateAverageVolume() {
-        if (this.klines.length === 0) return 0;
-        
-        // 只使用已完成的K线计算均值（排除最后一根可能正在进行的K线）
-        const completedKlines = this.klines.slice(0, -1);
-        if (completedKlines.length === 0) return 0;
-        
-        const totalVolume = completedKlines.reduce((sum, kline) => {
-            return sum + parseFloat(kline.volume);
-        }, 0);
-        
-        return totalVolume / completedKlines.length;
-    }
-
-    // 获取详细的成交量统计信息
-    getVolumeStats() {
-        if (this.klines.length === 0) return null;
-
-        // 使用已完成的K线
-        const completedKlines = this.klines.slice(0, -1);
-        if (completedKlines.length === 0) return null;
-
-        const volumes = completedKlines.map(k => parseFloat(k.volume));
-        const avgVolume = this.calculateAverageVolume();
-        const maxVolume = Math.max(...volumes);
-        const minVolume = Math.min(...volumes);
-
-        return {
-            average: avgVolume,
-            max: maxVolume,
-            min: minVolume,
-            count: completedKlines.length,
-            latest: volumes[volumes.length - 1],
-            windowSize: this.klines.length
-        };
-    }
-    // 分析当前买入量相对于历史均值成交量的情况
-    analyzeVolume(currentBuyVolume) {
-        const stats = this.getVolumeStats();
-        if (!stats || stats.count < 5) { // 至少需要5根历史K线才能分析
-            return {
-                symbol: this.symbol,
-                currentBuyVolume,
-                averageVolume: 0,
-                difference: 0,
-                percentageChange: 0,
-                volumeLevel: '数据不足',
-                isAboveAverage: false,
-                historicalCount: stats ? stats.count : 0
-            };
-        }
-
-        const avgVolume = stats.average;
-        const difference = currentBuyVolume - avgVolume;
-        const percentageChange = (difference / avgVolume) * 100;
-
-        let volumeLevel = '正常';
-        if (percentageChange > 200) {
-            volumeLevel = '极端放量'; // 新增：200%以上为极端放量
-        } else if (percentageChange > 100) {
-            volumeLevel = '剧烈放量'; // 新增：100-200%为剧烈放量
-        } else if (percentageChange > 50) {
-            volumeLevel = '异常放量';
-        } else if (percentageChange > 20) {
-            volumeLevel = '明显放量';
-        } else if (percentageChange > 10) {
-            volumeLevel = '轻微放量';
-        } else if (percentageChange < -30) {
-            volumeLevel = '异常缩量';
-        } else if (percentageChange < -15) {
-            volumeLevel = '明显缩量';
-        } else if (percentageChange < -5) {
-            volumeLevel = '轻微缩量';
-        }
-
-        return {
-            symbol: this.symbol,
-            currentBuyVolume,
-            averageVolume: avgVolume,
-            difference,
-            percentageChange,
-            volumeLevel,
-            isAboveAverage: currentBuyVolume > avgVolume,
-            historicalCount: stats.count
-        };
-    }
-
-    // 获取当前状态摘要
-    getStatusSummary() {
-        const stats = this.getVolumeStats();
-        return {
-            symbol: this.symbol,
-            initialized: this.isInitialized,
-            klineCount: this.klines.length,
-            completedKlineCount: stats ? stats.count : 0,
-            averageVolume: stats ? stats.average.toFixed(0) : '0',
-            lastUpdate: new Date(this.lastUpdateTime).toLocaleString('zh-CN')
-        };
-    }
-
-    // 新增：比较当前K线买入量与历史均值成交量
-    compareBuyVolumeWithAverageVolume(currentBuyVolume) {
-        if (this.klines.length === 0) {
-            return {
-                symbol: this.symbol,
                 currentBuyVolume: 0,
-                averageVolume: 0,
-                difference: 0,
-                percentageChange: 0,
-                comparison: '数据不足',
-                isAboveAverage: false,
+                averageBuyVolume: 0,
                 historicalCount: 0,
-                message: '暂无K线数据'
+                buyVolumeHistory: []
             };
         }
 
-        // 使用已完成的K线计算均值（排除最后一根可能正在进行的K线）
-        const completedKlines = this.klines.slice(0, -1);
-        if (completedKlines.length === 0) {
-            return {
-                symbol: this.symbol,
-                currentBuyVolume: currentBuyVolume,
-                averageVolume: 0,
-                difference: 0,
-                percentageChange: 0,
-                comparison: '数据不足',
-                isAboveAverage: false,
-                historicalCount: 0,
-                message: '暂无已完成的K线数据'
-            };
-        }
-
-        // 计算历史K线的平均成交量
-        const totalVolume = completedKlines.reduce((sum, kline) => {
-            return sum + parseFloat(kline.volume);
-        }, 0);
-        const averageVolume = totalVolume / completedKlines.length;
-
-        // 计算差异和百分比变化
-        const difference = currentBuyVolume - averageVolume;
-        const percentageChange = (difference / averageVolume) * 100;
-
-        // 判断比较结果
-        let comparison = '正常';
-        let message = '';
+        const currentBuyVolume = this.buyVolumes[this.buyVolumes.length - 1];
+        const averageBuyVolume = this.calculateAverageBuyVolume();
         
-        if (percentageChange > 200) {
-            comparison = '极端放量';
-            message = '当前买入量远超历史均值，可能存在重大利好或资金大量涌入';
-        } else if (percentageChange > 100) {
-            comparison = '剧烈放量';
-            message = '当前买入量显著高于历史均值，显示强烈的买入意愿';
-        } else if (percentageChange > 50) {
-            comparison = '异常放量';
-            message = '当前买入量明显高于历史均值，可能存在异常情况';
-        } else if (percentageChange > 20) {
-            comparison = '明显放量';
-            message = '当前买入量高于历史均值，显示一定的买入压力';
-        } else if (percentageChange > 10) {
-            comparison = '轻微放量';
-            message = '当前买入量略高于历史均值，买入意愿有所增强';
-        } else if (percentageChange < -30) {
-            comparison = '异常缩量';
-            message = '当前买入量明显低于历史均值，买入意愿显著减弱';
-        } else if (percentageChange < -15) {
-            comparison = '明显缩量';
-            message = '当前买入量低于历史均值，买入意愿有所减弱';
-        } else if (percentageChange < -5) {
-            comparison = '轻微缩量';
-            message = '当前买入量略低于历史均值，买入意愿略有减弱';
-        } else {
-            comparison = '正常水平';
-            message = '当前买入量与历史均值基本持平，市场表现正常';
+        return {
+            currentBuyVolume,
+            averageBuyVolume,
+            historicalCount: this.buyVolumes.length,
+            buyVolumeHistory: [...this.buyVolumes]
+        };
+    }
+
+    // 分析买入量变化 - 只检测放量
+    analyzeBuyVolume(currentBuyVolume) {
+        if (this.buyVolumes.length < 5) {
+            return null; // 数据不足
         }
 
+        const averageBuyVolume = this.calculateAverageBuyVolume();
+        const percentageChange = ((currentBuyVolume - averageBuyVolume) / averageBuyVolume) * 100;
+        
+        // 只检测放量，不检测缩量
+        if (percentageChange <= 0) {
+            return null; // 不是放量，返回null
+        }
+        
+        // 只检测放量大于配置阈值的情况
+        if (percentageChange <= TRADING_CONFIG.MIN_VOLUME_INCREASE_PERCENT) {
+            return null; // 放量程度不够，返回null
+        }
+        
+        // 确定买入量放量等级
+        let buyVolumeLevel = '🔥 极度放量';
+        if (percentageChange > 500) buyVolumeLevel = '🚨 超级放量';
+        else if (percentageChange > 300) buyVolumeLevel = '🔥 极度放量';
+        else if (percentageChange > 200) buyVolumeLevel = '📈 大幅放量';
+        
         return {
-            symbol: this.symbol,
-            currentBuyVolume: currentBuyVolume,
-            averageVolume: averageVolume,
-            difference: difference,
-            percentageChange: percentageChange,
-            comparison: comparison,
-            isAboveAverage: currentBuyVolume > averageVolume,
-            historicalCount: completedKlines.length,
-            message: message,
-            // 添加详细信息
-            details: {
-                historicalVolumes: completedKlines.map(k => parseFloat(k.volume)),
-                maxVolume: Math.max(...completedKlines.map(k => parseFloat(k.volume))),
-                minVolume: Math.min(...completedKlines.map(k => parseFloat(k.volume))),
-                volumeStdDev: this.calculateVolumeStandardDeviation(completedKlines.map(k => parseFloat(k.volume)))
+            currentBuyVolume,
+            averageBuyVolume,
+            percentageChange,
+            buyVolumeLevel,
+            historicalCount: this.buyVolumes.length,
+            isAbnormal: percentageChange > 200 // 只有超过200%才算异常
+        };
+    }
+
+    // 新增：检测两根K线（15分钟周期）内的放量情况，并检查价格变化
+    analyzeTwoKlineVolume() {
+        if (this.klines.length < 2) {
+            return null; // 至少需要2根K线
+        }
+
+        // 获取最近两根K线，确保它们是不同的K线
+        const recentKlines = this.klines.slice(-2);
+        const firstKline = recentKlines[0];
+        const secondKline = recentKlines[1];
+        
+        // 验证两根K线是否真的不同（通过时间戳判断）
+        if (firstKline.closeTime === secondKline.closeTime) {
+            return null; // 同一根K线，返回null
+        }
+        
+        // 验证K线时间间隔是否正确（5分钟间隔）
+        const timeDiff = Math.abs(secondKline.closeTime - firstKline.closeTime);
+        const expectedInterval = 5 * 60 * 1000; // 5分钟 = 300000毫秒
+        const tolerance = 10 * 1000; // 允许10秒的误差
+        
+        if (Math.abs(timeDiff - expectedInterval) > tolerance) {
+            return null; // 时间间隔不正确，可能不是连续的K线
+        }
+        
+        // 计算价格变化
+        const firstClosePrice = parseFloat(firstKline.close);
+        const secondClosePrice = parseFloat(secondKline.close);
+        const priceChange = secondClosePrice - firstClosePrice;
+        const priceChangePercentage = (priceChange / firstClosePrice) * 100;
+        
+        // 只检测价格上升的情况，价格下降时返回null
+        // 这样可以避免在价格下跌时误报，只关注真正的上涨趋势
+        if (priceChange <= 0) {
+            return null; // 价格没有上升，返回null
+        }
+        
+        // 检查价格上升是否超过配置的阈值
+        if (priceChangePercentage < TRADING_CONFIG.MIN_PRICE_INCREASE_PERCENT) {
+            return null; // 价格上升幅度不够，返回null
+        }
+        
+        // 计算第一根K线的放量情况
+        const firstAnalysis = this.analyzeBuyVolume(firstKline.buyVolume);
+        // 计算第二根K线的放量情况
+        const secondAnalysis = this.analyzeBuyVolume(secondKline.buyVolume);
+        
+        // 如果两根K线都没有放量，返回null
+        if (!firstAnalysis && !secondAnalysis) {
+            return null;
+        }
+        
+        // 如果只有一根K线放量，返回null（不满足两根K线的要求）
+        if (!firstAnalysis || !secondAnalysis) {
+            return null;
+        }
+        
+        // 两根K线都放量，计算综合指标
+        const totalBuyVolume = firstKline.buyVolume + secondKline.buyVolume;
+        const totalAverageBuyVolume = (firstAnalysis.averageBuyVolume + secondAnalysis.averageBuyVolume) / 2;
+        const totalPercentageChange = ((totalBuyVolume - totalAverageBuyVolume) / totalAverageBuyVolume) * 100;
+        
+        // 确定综合放量等级
+        let combinedBuyVolumeLevel = '🔥 极度放量';
+        if (totalPercentageChange > 500) combinedBuyVolumeLevel = '🚨 超级放量';
+        else if (totalPercentageChange > 300) combinedBuyVolumeLevel = '🔥 极度放量';
+        else if (totalPercentageChange > TRADING_CONFIG.MIN_VOLUME_INCREASE_PERCENT) combinedBuyVolumeLevel = '📈 大幅放量';
+        
+        return {
+            firstKline: {
+                time: firstKline.closeTime,
+                buyVolume: firstKline.buyVolume,
+                percentageChange: firstAnalysis.percentageChange,
+                buyVolumeLevel: firstAnalysis.buyVolumeLevel,
+                closePrice: firstClosePrice
+            },
+            secondKline: {
+                time: secondKline.closeTime,
+                buyVolume: secondKline.buyVolume,
+                percentageChange: secondAnalysis.percentageChange,
+                buyVolumeLevel: secondAnalysis.buyVolumeLevel,
+                closePrice: secondClosePrice
+            },
+            priceChange: {
+                absolute: priceChange,
+                percentage: priceChangePercentage,
+                isUp: true
+            },
+            combined: {
+                totalBuyVolume,
+                totalAverageBuyVolume,
+                totalPercentageChange,
+                buyVolumeLevel: combinedBuyVolumeLevel,
+                isAbnormal: totalPercentageChange > TRADING_CONFIG.MIN_VOLUME_INCREASE_PERCENT
+            },
+            historicalCount: this.buyVolumes.length,
+            // 添加验证信息
+            validation: {
+                timeDiff: timeDiff,
+                expectedInterval: expectedInterval,
+                isValidInterval: Math.abs(timeDiff - expectedInterval) <= tolerance,
+                firstKlineTime: new Date(firstKline.closeTime).toISOString(),
+                secondKlineTime: new Date(secondKline.closeTime).toISOString()
             }
         };
     }
 
-    // 计算成交量的标准差
-    calculateVolumeStandardDeviation(volumes) {
-        if (volumes.length < 2) return 0;
-        
-        const mean = volumes.reduce((sum, vol) => sum + vol, 0) / volumes.length;
-        const squaredDiffs = volumes.map(vol => Math.pow(vol - mean, 2));
-        const variance = squaredDiffs.reduce((sum, diff) => sum + diff, 0) / volumes.length;
-        
-        return Math.sqrt(variance);
+    // 获取状态摘要
+    getStatusSummary() {
+        const stats = this.getBuyVolumeStats();
+        return {
+            symbol: this.symbol,
+            klineCount: this.klines.length,
+            buyVolumeCount: this.buyVolumes.length,
+            currentBuyVolume: stats.currentBuyVolume,
+            averageBuyVolume: stats.averageBuyVolume,
+            lastUpdate: this.lastUpdateTime,
+            isInitialized: this.isInitialized
+        };
     }
 }
 
 // 创建多币种管理器实例
 const multiManager = new MultiSymbolKlineManager();
 
-// 获取单个币种的历史K线数据（优化版本）
+// 获取单个币种的历史K线数据
 async function fetchHistoricalKlines(symbol) {
     try {
+        console.log(`📊 获取 ${symbol} 历史数据...`);
+        
         const response = await axiosInstance.get(CONFIG.apiUrl, {
             params: {
                 symbol: symbol,
                 interval: CONFIG.interval,
                 limit: CONFIG.historyLimit
             },
-            timeout: 15000 // 增加超时时间
+            timeout: 10000
         });
 
         const historicalKlines = response.data.map(kline => ({
@@ -2791,228 +1956,379 @@ async function fetchHistoricalKlines(symbol) {
             close: parseFloat(kline[4]),
             volume: parseFloat(kline[5]),
             quoteVolume: parseFloat(kline[7]),
-            trades: parseInt(kline[8])
+            trades: parseInt(kline[8]),
+            buyVolume: parseFloat(kline[9]), // 新增：买入量
+            buyQuoteVolume: parseFloat(kline[10]) // 新增：买入成交额
         }));
 
         const klineManager = multiManager.getKlineManager(symbol);
         if (klineManager) {
-            // 添加历史K线数据
             historicalKlines.forEach(kline => {
                 klineManager.addKline(kline);
             });
-            
-            // 预填充成交量历史记录
-            const recentKlines = historicalKlines.slice(-10);
-            recentKlines.forEach(kline => {
-                klineManager.updateVolumeHistory(kline.volume);
-            });
-            
             klineManager.isInitialized = true;
 
-            const stats = klineManager.getVolumeStats();
-            if (stats) {
-                console.log(`✅ ${symbol} 数据加载完成 - 平均成交量: ${stats.average.toFixed(2)}`);
-            }
+            const stats = klineManager.getBuyVolumeStats();
+            console.log(`✅ ${symbol} 数据加载完成 - 平均买入量: ${stats.averageBuyVolume.toFixed(2)}`);
         }
 
         return true;
     } catch (error) {
-        if (error.response && error.response.status === 429) {
-            // 遇到速率限制，等待后重试
-            console.log(`⏳ ${symbol} 遇到速率限制，等待重试...`);
-            await new Promise(resolve => setTimeout(resolve, 2000));
-            return await fetchHistoricalKlines(symbol);
-        } else {
-            console.error(`❌ ${symbol} 历史数据获取失败:`, error.message);
-            return false;
-        }
+        console.error(`❌ ${symbol} 历史数据获取失败:`, error.message);
+        return false;
     }
 }
 
-// 处理完成的K线数据
+// 为单个币种建立WebSocket连接
+function connectWebSocketForSymbol(symbol) {
+    const wsUrl = `${CONFIG.wsBaseUrl}${symbol.toLowerCase()}@kline_${CONFIG.interval}`;
+    
+    // 增强的WebSocket连接选项
+    const wsOptions = {
+        agent: agent,
+        handshakeTimeout: 30000, // 增加握手超时时间到30秒
+        maxPayload: 1024 * 1024, // 1MB最大负载
+        perMessageDeflate: false, // 禁用消息压缩以提高性能
+        followRedirects: true, // 允许重定向
+        headers: { 
+            'User-Agent': 'Mozilla/5.0 (Multi-Symbol Volume Monitor)',
+            'Accept-Encoding': 'gzip, deflate',
+            'Cache-Control': 'no-cache'
+        }
+    };
+    
+    const ws = new WebSocket(wsUrl, wsOptions);
+
+    ws.on('open', () => {
+        console.log(`🔗 ${symbol} WebSocket连接成功`);
+    });
+
+    ws.on('message', (data) => {
+        // 更新连接活动时间
+        ws.lastActivityTime = Date.now();
+        
+        try {
+            const message = JSON.parse(data);
+            const klineData = message.k;
+
+            if (klineData) {
+                // 构建K线对象，包含买入量数据
+                const currentKline = {
+                    openTime: parseInt(klineData.t),
+                    closeTime: parseInt(klineData.T),
+                    open: parseFloat(klineData.o),
+                    high: parseFloat(klineData.h),
+                    low: parseFloat(klineData.l),
+                    close: parseFloat(klineData.c),
+                    volume: parseFloat(klineData.v),
+                    quoteVolume: parseFloat(klineData.q),
+                    trades: parseInt(klineData.n),
+                    isCompleted: klineData.x, // K线是否已完成
+                    buyVolume: parseFloat(klineData.V || 0), // 主动买入的成交量
+                    buyQuoteVolume: parseFloat(klineData.Q || 0) // 主动买入的成交额
+                };
+
+                // 更新K线管理器（包括进行中的K线）
+                const klineManager = multiManager.getKlineManager(symbol);
+                if (klineManager && klineManager.isInitialized) {
+                    // 添加或更新K线数据
+                    klineManager.addKline(currentKline);
+                    
+                    // 只有在K线真正完成时才进行详细分析
+                    if (klineData.x) {
+                        // 添加延迟，确保K线数据完全更新
+                        setTimeout(() => {
+                            handleCompletedKline(symbol, currentKline);
+                        }, 1000); // 延迟1秒，确保数据完整性
+                    }
+                    // 如果是进行中的K线，进行简单监控（每30秒显示一次）
+                    else {
+                        handleOngoingKline(symbol, currentKline);
+                    }
+                }
+            }
+        } catch (error) {
+            console.error(`❌ ${symbol} 消息处理失败:`, error.message);
+        }
+    });
+
+    ws.on('error', (error) => {
+        console.error(`❌ ${symbol} WebSocket错误:`, error.message);
+        
+        // 根据错误类型提供具体的解决建议
+        if (error.message.includes('TLS connection')) {
+            console.log(`💡 ${symbol} TLS连接问题，可能原因：`);
+            console.log(`   - 网络连接不稳定`);
+            console.log(`   - 代理配置问题`);
+            console.log(`   - 防火墙限制`);
+        } else if (error.message.includes('ECONNREFUSED')) {
+            console.log(`💡 ${symbol} 连接被拒绝，可能原因：`);
+            console.log(`   - 网络端口被阻止`);
+            console.log(`   - 代理服务器问题`);
+        } else if (error.message.includes('ETIMEDOUT')) {
+            console.log(`💡 ${symbol} 连接超时，可能原因：`);
+            console.log(`   - 网络延迟过高`);
+            console.log(`   - 服务器响应慢`);
+        }
+        
+        // 智能重连策略
+        const retryDelay = calculateRetryDelay(symbol);
+        setTimeout(() => {
+            console.log(`🔄 ${symbol} ${retryDelay/1000}秒后尝试重连...`);
+            connectWebSocketForSymbol(symbol);
+        }, retryDelay);
+    });
+
+    ws.on('close', (code, reason) => {
+        console.log(`⚠️ ${symbol} WebSocket连接断开 - 代码: ${code}, 原因: ${reason}`);
+        
+        // 根据关闭代码提供建议
+        if (code === 1006) {
+            console.log(`💡 ${symbol} 异常断开，可能是网络问题`);
+        } else if (code === 1015) {
+            console.log(`💡 ${symbol} TLS握手失败，检查网络环境`);
+        }
+        
+        // 智能重连策略
+        const retryDelay = calculateRetryDelay(symbol);
+        setTimeout(() => {
+            console.log(`🔄 ${symbol} ${retryDelay/1000}秒后尝试重连...`);
+            connectWebSocketForSymbol(symbol);
+        }, retryDelay);
+    });
+
+    multiManager.setConnection(symbol, ws);
+    return ws;
+}
+
+// 处理完成的K线数据 - 检测买入量放量
 async function handleCompletedKline(symbol, klineData) {
     const klineManager = multiManager.getKlineManager(symbol);
     if (!klineManager || !klineManager.isInitialized) {
         return;
     }
 
-    // 使用新的综合趋势分析方法
-    const analysis = klineManager.analyzeComprehensiveTrend(klineData.buyVolume || 0);
+    // 两种推送逻辑，满足其一就进行推送：
+    // 1. 单根K线极端放量：单根K线买入量超过平均值的210%时推送
+    // 2. 两根K线连续放量：两根K线都放量且综合放量超过200%时推送
+
+    // 1. 首先检测单根K线极端放量
+    const currentBuyVolume = parseFloat(klineData.buyVolume || klineData.volume);
+    const singleKlineAnalysis = klineManager.analyzeBuyVolume(currentBuyVolume);
     
-    // 新增：比较当前K线买入量与历史均值成交量
-    const buyVolumeComparison = klineManager.compareBuyVolumeWithAverageVolume(klineData.buyVolume);
+    // 2. 使用新的两根K线检测逻辑
+    const twoKlineAnalysis = klineManager.analyzeTwoKlineVolume();
     
-    if (analysis) {
-        const timeStr = new Date(klineData.closeTime).toLocaleString('zh-CN');
-        const priceChange = klineData.close > klineData.open ? '📈' : '📉';
-        const priceChangePercent = ((klineData.close - klineData.open) / klineData.open * 100).toFixed(2);
+    // 添加调试日志，显示检测结果
+    console.log(`\n🔍 ${symbol} K线检测结果:`);
+    console.log(`   📊 单根K线放量: ${singleKlineAnalysis ? `+${singleKlineAnalysis.percentageChange.toFixed(1)}%` : '无'}`);
+    console.log(`   📊 两根K线放量: ${twoKlineAnalysis ? `+${twoKlineAnalysis.combined.totalPercentageChange.toFixed(1)}%` : '无'}`);
+    
+    // 如果检测到单根K线极端放量（超过配置阈值），立即推送警报
+    if (singleKlineAnalysis && singleKlineAnalysis.percentageChange > TRADING_CONFIG.SINGLE_KLINE_EXTREME_VOLUME_PERCENT) {
+        console.log(`   🚨 触发单根K线推送 (${singleKlineAnalysis.percentageChange.toFixed(1)}% > ${TRADING_CONFIG.SINGLE_KLINE_EXTREME_VOLUME_PERCENT}%)`);
+        await handleSingleKlineExtremeVolume(symbol, klineData, singleKlineAnalysis);
+    }
+    
+    // 如果没有检测到两根K线都放量，直接返回
+    if (!twoKlineAnalysis) {
+        console.log(`   ❌ 两根K线检测失败，不满足推送条件`);
+        return;
+    }
+    
+    // 添加调试日志，验证两根K线信息
+    console.log(`\n🔍 ${symbol} 两根K线验证信息:`);
+    console.log(`   📅 第一根K线: ${new Date(twoKlineAnalysis.validation.firstKlineTime).toLocaleString('zh-CN')}`);
+    console.log(`   📅 第二根K线: ${new Date(twoKlineAnalysis.validation.secondKlineTime).toLocaleString('zh-CN')}`);
+    console.log(`   ⏱️  时间间隔: ${twoKlineAnalysis.validation.timeDiff}ms (期望: ${twoKlineAnalysis.validation.expectedInterval}ms)`);
+    console.log(`   ✅ 间隔验证: ${twoKlineAnalysis.validation.isValidInterval ? '通过' : '失败'}`);
+    
+    const firstTimeStr = new Date(twoKlineAnalysis.firstKline.time).toLocaleString('zh-CN');
+    const secondTimeStr = new Date(twoKlineAnalysis.secondKline.time).toLocaleString('zh-CN');
+    
+    // 检查是否为异常放量（大于200%）
+    const isAbnormal = twoKlineAnalysis.combined.isAbnormal;
+    
+    if (isAbnormal) {
+        console.log(`   🚨 触发两根K线推送 (${twoKlineAnalysis.combined.totalPercentageChange.toFixed(1)}% > ${TRADING_CONFIG.MIN_VOLUME_INCREASE_PERCENT}%)`);
         
-        // 使用新的智能警报判断
-        const shouldAlert = analysis.shouldAlert;
+        // 异常放量：获取详细信息并整合显示
+        const tokenDetails = await getCachedTokenDetails(symbol);
         
-        if (shouldAlert) {
-            // 高置信度放量异常：获取详细信息并整合显示
-            const tokenDetails = await getCachedTokenDetails(symbol);
+        // 控制台输出
+        console.log(`\n🚨 ====== ${symbol} 两根K线买入量放量警报 ======`);
+        console.log(`⏰ 第一根K线时间: ${firstTimeStr}`);
+        console.log(`📊 第一根K线买入量: ${twoKlineAnalysis.firstKline.buyVolume.toFixed(0)} | 放量程度: +${twoKlineAnalysis.firstKline.percentageChange.toFixed(1)}% | 评级: ${twoKlineAnalysis.firstKline.buyVolumeLevel}`);
+        console.log(`💰 第一根K线收盘价: ${twoKlineAnalysis.firstKline.closePrice.toFixed(6)}`);
+        console.log(`⏰ 第二根K线时间: ${secondTimeStr}`);
+        console.log(`📊 第二根K线买入量: ${twoKlineAnalysis.secondKline.buyVolume.toFixed(0)} | 放量程度: +${twoKlineAnalysis.secondKline.percentageChange.toFixed(1)}% | 评级: ${twoKlineAnalysis.secondKline.buyVolumeLevel}`);
+        console.log(`💰 第二根K线收盘价: ${twoKlineAnalysis.secondKline.closePrice.toFixed(6)}`);
+        console.log(`\n📈 价格变化:`);
+        console.log(`📈 价格变化: +${twoKlineAnalysis.priceChange.absolute.toFixed(6)} (+${twoKlineAnalysis.priceChange.percentage.toFixed(2)}%)`);
+        console.log(`\n📊 综合指标:`);
+        console.log(`📊 总买入量: ${twoKlineAnalysis.combined.totalBuyVolume.toFixed(0)} | 30根均值: ${twoKlineAnalysis.combined.totalAverageBuyVolume.toFixed(0)}`);
+        console.log(`📊 综合放量程度: +${twoKlineAnalysis.combined.totalPercentageChange.toFixed(1)}% | 综合评级: ${twoKlineAnalysis.combined.buyVolumeLevel}`);
+        console.log(`📊 历史数据: ${twoKlineAnalysis.historicalCount}根K线`);
+        
+        if (tokenDetails) {
+            console.log(`\n📋 ${symbol} 币种信息:`);
+            console.log(`${'─'.repeat(50)}`);
             
-            // 控制台输出
-            console.log(`\n🚨 ====== ${symbol} 连续放量异常警报 ======`);
-            console.log(`⏰ 时间: ${timeStr}`);
-            console.log(`💰 价格变化: ${klineData.open} → ${klineData.close} (${priceChange} ${priceChangePercent}%)`);
-            console.log(`📊 买入量异常: ${analysis.currentBuyVolume.toFixed(0)} | 30根均值成交量: ${analysis.averageVolume.toFixed(0)}`);
-            console.log(`📊 异常程度: ${analysis.percentageChange.toFixed(1)}% | 评级: ${analysis.volumeLevel}`);
-            console.log(`📊 历史数据: ${analysis.historicalCount}根K线`);
-            console.log(`🎯 综合评分: ${analysis.confidenceScore.toFixed(1)}/100`);
-            console.log(`🔄 连续放量: ${analysis.consecutiveInfo.consecutiveCount}次`);
-            console.log(`📈 买入量趋势: ${analysis.volumeTrend.trend} (强度: ${analysis.volumeTrend.strength.toFixed(1)}%)`);
-            console.log(`📊 趋势详情: ${analysis.trendReason}`);
-            
-            // 新增：显示买入量与均值成交量比较
-            console.log(`\n📈 ====== 买入量分析 ======`);
-            console.log(`📊 当前买入量: ${buyVolumeComparison.currentBuyVolume.toFixed(0)}`);
-            console.log(`📊 历史均值成交量: ${buyVolumeComparison.averageVolume.toFixed(0)}`);
-            console.log(`📊 差异: ${buyVolumeComparison.difference > 0 ? '+' : ''}${buyVolumeComparison.difference.toFixed(0)}`);
-            console.log(`📊 变化百分比: ${buyVolumeComparison.percentageChange > 0 ? '+' : ''}${buyVolumeComparison.percentageChange.toFixed(1)}%`);
-            console.log(`📊 比较结果: ${buyVolumeComparison.comparison}`);
-            console.log(`📊 分析说明: ${buyVolumeComparison.message}`);
-            console.log(`📊 历史K线数量: ${buyVolumeComparison.historicalCount}根`);
-            if (buyVolumeComparison.details) {
-                console.log(`📊 历史最高成交量: ${buyVolumeComparison.details.maxVolume.toFixed(0)}`);
-                console.log(`📊 历史最低成交量: ${buyVolumeComparison.details.minVolume.toFixed(0)}`);
-                console.log(`📊 成交量标准差: ${buyVolumeComparison.details.volumeStdDev.toFixed(0)}`);
-            }
-            
-            // 新增：异常趋势分析显示
-            if (analysis.abnormalTrendAnalysis && analysis.abnormalTrendAnalysis.trend !== 'insufficient') {
-                const abnormalTrend = analysis.abnormalTrendAnalysis;
-                console.log(`\n🔍 放量异常趋势分析:`);
-                console.log(`📊 异常趋势: ${abnormalTrend.trend} (强度: ${abnormalTrend.strength.toFixed(1)}%)`);
-                console.log(`📊 趋势原因: ${abnormalTrend.reason}`);
-                
-                if (abnormalTrend.details) {
-                    const details = abnormalTrend.details;
-                    console.log(`📊 强度趋势: ${details.intensityTrend.trend} (${details.intensityTrend.strength.toFixed(1)}%)`);
-                    console.log(`📊 异常频率: ${details.frequencyAnalysis.frequency} (${details.frequencyAnalysis.score.toFixed(1)}%)`);
-                    console.log(`📊 异常模式: ${details.patternAnalysis.pattern} (置信度: ${details.patternAnalysis.confidence.toFixed(1)}%)`);
-                    console.log(`📊 时间序列: ${details.timeSeriesAnalysis.trend} (波动性: ${details.timeSeriesAnalysis.volatility.toFixed(1)}%)`);
-                }
-            }
-            
-            if (analysis.volumeTrend.details && analysis.volumeTrend.details.shortTerm) {
-                console.log(`📊 短期买入量趋势: ${analysis.volumeTrend.details.shortTerm.reason}`);
-                console.log(`📊 中期买入量趋势: ${analysis.volumeTrend.details.mediumTerm.reason}`);
-                console.log(`📊 长期买入量趋势: ${analysis.volumeTrend.details.longTerm.reason}`);
-            }
-            console.log(`⚡ 动态阈值: ${analysis.dynamicThreshold.toFixed(1)}%`);
-            
-            if (tokenDetails) {
-                console.log(`\n📋 ${symbol} 币种信息:`);
-                console.log(`${'─'.repeat(50)}`);
-                
-                // 显示合约信息
-                if (tokenDetails.contractInfo) {
-                    const onboardDate = new Date(tokenDetails.contractInfo.onboardDate).toLocaleString('zh-CN');
-                    console.log(`📅 合约上线时间: ${onboardDate}`);
-                    console.log(`📊 合约状态: ${tokenDetails.contractInfo.status}`);
-                    console.log(`📋 合约类型: ${tokenDetails.contractInfo.contractType}`);
-                } else {
-                    console.log(`❌ 合约信息获取失败`);
-                }
-                
-                // 显示持仓量信息
-                if (tokenDetails.openInterest) {
-                    const oiTime = new Date(tokenDetails.openInterest.timestamp).toLocaleString('zh-CN');
-                    const oiValue = (parseFloat(tokenDetails.openInterest.openInterestValue) / 1000000).toFixed(2);
-                    console.log(`📈 当前持仓量: ${tokenDetails.openInterest.openInterest}`);
-                    console.log(`💰 持仓总价值: ${oiValue}M USDT`);
-                    console.log(`⏰ 数据时间: ${oiTime}`);
-                } else {
-                    console.log(`❌ 持仓量信息获取失败`);
-                }
-                
-                console.log(`${'─'.repeat(50)}`);
+            // 显示合约信息
+            if (tokenDetails.contractInfo) {
+                const onboardDate = new Date(tokenDetails.contractInfo.onboardDate).toLocaleString('zh-CN');
+                console.log(`📅 合约上线时间: ${onboardDate}`);
+                console.log(`📊 合约状态: ${tokenDetails.contractInfo.status}`);
+                console.log(`📋 合约类型: ${tokenDetails.contractInfo.contractType}`);
             } else {
-                console.log(`❌ 无法获取 ${symbol} 详细信息`);
+                console.log(`❌ 合约信息获取失败`);
             }
             
-            console.log(`🔥 连续放量异常警报: ${symbol} 连续${analysis.consecutiveInfo.consecutiveCount}次异常放量！`);
-            console.log(`==========================================`);
+            // 显示持仓量信息
+            if (tokenDetails.openInterest) {
+                const oiTime = new Date(tokenDetails.openInterest.timestamp).toLocaleString('zh-CN');
+                const oiValue = (parseFloat(tokenDetails.openInterest.openInterestValue) / 1000000).toFixed(2);
+                console.log(`📈 当前持仓量: ${tokenDetails.openInterest.openInterest}`);
+                console.log(`💰 持仓总价值: ${oiValue}M USDT`);
+                console.log(`⏰ 数据时间: ${oiTime}`);
+            } else {
+                console.log(`❌ 持仓量信息获取失败`);
+            }
             
-            // 构建Telegram消息
-            let telegramMessage = `🚨 ${symbol} 连续放量异常警报\n\n`;
-            telegramMessage += `⏰ 时间: ${timeStr}\n`;
-            telegramMessage += `💰 价格: ${klineData.open} → ${klineData.close} (${priceChange} ${priceChangePercent}%)\n`;
-            telegramMessage += `📊 买入量: ${analysis.currentBuyVolume.toFixed(0)} | 30根均值成交量: ${analysis.averageVolume.toFixed(0)}\n`;
-            telegramMessage += `📊 异常程度: ${analysis.percentageChange.toFixed(1)}% | 评级: ${analysis.volumeLevel}\n`;
-            telegramMessage += `🎯 综合评分: ${analysis.confidenceScore.toFixed(1)}/100\n`;
-            telegramMessage += `🔄 连续放量: ${analysis.consecutiveInfo.consecutiveCount}次\n`;
-            telegramMessage += `📈 趋势: ${analysis.volumeTrend.trend} (强度: ${analysis.volumeTrend.strength.toFixed(1)}%)\n`;
+            console.log(`${'─'.repeat(50)}`);
+        } else {
+            console.log(`❌ 无法获取 ${symbol} 详细信息`);
+        }
+        
+        console.log(`🔥 警报: ${symbol} 两根K线连续买入量异常放量！`);
+        console.log(`📈 价格上升: +${twoKlineAnalysis.priceChange.percentage.toFixed(2)}%`);
+        console.log(`==========================================`);
+        
+        // 构建Telegram消息
+        let telegramMessage = `🚨 ${symbol} 两根K线买入量放量警报\n\n`;
+        telegramMessage += `⏰ 第一根K线: ${firstTimeStr}\n`;
+        telegramMessage += `📊 买入量: ${twoKlineAnalysis.firstKline.buyVolume.toFixed(0)} | 放量: +${twoKlineAnalysis.firstKline.percentageChange.toFixed(1)}% | 评级: ${twoKlineAnalysis.firstKline.buyVolumeLevel}\n`;
+        telegramMessage += `💰 收盘价: ${twoKlineAnalysis.firstKline.closePrice.toFixed(6)}\n`;
+        telegramMessage += `⏰ 第二根K线: ${secondTimeStr}\n`;
+        telegramMessage += `📊 买入量: ${twoKlineAnalysis.secondKline.buyVolume.toFixed(0)} | 放量: +${twoKlineAnalysis.secondKline.percentageChange.toFixed(1)}% | 评级: ${twoKlineAnalysis.secondKline.buyVolumeLevel}\n`;
+        telegramMessage += `💰 收盘价: ${twoKlineAnalysis.secondKline.closePrice.toFixed(6)}\n\n`;
+        telegramMessage += `📈 价格变化: +${twoKlineAnalysis.priceChange.absolute.toFixed(6)} (+${twoKlineAnalysis.priceChange.percentage.toFixed(2)}%)\n\n`;
+        telegramMessage += `📊 综合指标:\n`;
+        telegramMessage += `📊 总买入量: ${twoKlineAnalysis.combined.totalBuyVolume.toFixed(0)} | 30根均值: ${twoKlineAnalysis.combined.totalAverageBuyVolume.toFixed(0)}\n`;
+        telegramMessage += `📊 综合放量程度: +${twoKlineAnalysis.combined.totalPercentageChange.toFixed(1)}% | 综合评级: ${twoKlineAnalysis.combined.buyVolumeLevel}\n`;
+        telegramMessage += `📊 历史数据: ${twoKlineAnalysis.historicalCount}根K线\n\n`;
+        
+        if (tokenDetails) {
+            telegramMessage += `📋 币种信息:\n`;
             
-            // 新增：买入量比较信息到Telegram消息
-            telegramMessage += `\n📈 买入量分析:\n`;
-            telegramMessage += `📊 买入量: ${buyVolumeComparison.currentBuyVolume.toFixed(0)} | 均值: ${buyVolumeComparison.averageVolume.toFixed(0)}\n`;
-            telegramMessage += `📊 变化: ${buyVolumeComparison.percentageChange > 0 ? '+' : ''}${buyVolumeComparison.percentageChange.toFixed(1)}% | ${buyVolumeComparison.comparison}\n`;
-            telegramMessage += `📊 说明: ${buyVolumeComparison.message}\n`;
+            if (tokenDetails.contractInfo) {
+                const onboardDate = new Date(tokenDetails.contractInfo.onboardDate).toLocaleString('zh-CN');
+                telegramMessage += `📅 合约上线: ${onboardDate}\n`;
+                telegramMessage += `📊 合约状态: ${tokenDetails.contractInfo.status}\n`;
+            }
             
-            // 新增：异常趋势分析到Telegram消息
-            if (analysis.abnormalTrendAnalysis && analysis.abnormalTrendAnalysis.trend !== 'insufficient') {
-                const abnormalTrend = analysis.abnormalTrendAnalysis;
-                telegramMessage += `🔍 放量趋势: ${abnormalTrend.trend} (强度: ${abnormalTrend.strength.toFixed(1)}%)\n`;
-                telegramMessage += `📊 趋势分析: ${abnormalTrend.reason}\n`;
+            if (tokenDetails.openInterest) {
+                const oiValue = (parseFloat(tokenDetails.openInterest.openInterestValue) / 1000000).toFixed(2);
+                telegramMessage += `📈 当前持仓量: ${tokenDetails.openInterest.openInterest}\n`;
+                telegramMessage += `💰 持仓总价值: ${oiValue}M USDT\n`;
             }
             
             telegramMessage += `\n`;
-            
-            if (tokenDetails) {
-                telegramMessage += `📋 币种信息:\n`;
-                
-                if (tokenDetails.contractInfo) {
-                    const onboardDate = new Date(tokenDetails.contractInfo.onboardDate).toLocaleString('zh-CN');
-                    telegramMessage += `📅 合约上线: ${onboardDate}\n`;
-                    telegramMessage += `📊 合约状态: ${tokenDetails.contractInfo.status}\n`;
-                }
-                
-                if (tokenDetails.openInterest) {
-                    const oiValue = (parseFloat(tokenDetails.openInterest.openInterestValue) / 1000000).toFixed(2);
-                    telegramMessage += `📈 当前持仓量: ${tokenDetails.openInterest.openInterest}\n`;
-                    telegramMessage += `💰 持仓总价值: ${oiValue}M USDT\n`;
-                }
-                
-                telegramMessage += `\n`;
-            }
-            
-            telegramMessage += `🔥 连续放量异常警报: ${symbol} 连续${analysis.consecutiveInfo.consecutiveCount}次异常放量！`;
-            
-            // 发送到Telegram
-            enqueueTelegramMessage(telegramMessage);
-            
-        } else if (analysis.percentageChange > 20) {
-            // 中等放量异常：简单显示，不发送Telegram
-            console.log(`\n⚠️ ${symbol} 中等放量异常 | ${timeStr}`);
-            console.log(`💰 价格: ${klineData.open} → ${klineData.close} (${priceChange} ${priceChangePercent}%)`);
-            console.log(`📊 成交量: ${analysis.currentVolume.toFixed(0)} | 30根均值: ${analysis.averageVolume.toFixed(0)}`);
-            console.log(`📊 变化: ${analysis.percentageChange.toFixed(1)}% | 评级: ${analysis.volumeLevel}`);
-            console.log(`🎯 综合评分: ${analysis.confidenceScore.toFixed(1)}/100 (未达到连续放量阈值)`);
-            console.log(`🔄 连续放量: ${analysis.consecutiveInfo.consecutiveCount}次 (需要≥2次才推送)`);
-            console.log(`📈 趋势: ${analysis.volumeTrend.trend} (强度: ${analysis.volumeTrend.strength.toFixed(1)}%)`);
-            
-            // 显示异常趋势分析（如果有）
-            if (analysis.abnormalTrendAnalysis && analysis.abnormalTrendAnalysis.trend !== 'insufficient') {
-                const abnormalTrend = analysis.abnormalTrendAnalysis;
-                console.log(`🔍 放量趋势: ${abnormalTrend.trend} (强度: ${abnormalTrend.strength.toFixed(1)}%)`);
-            }
-        } else {
-            // 正常成交量或缩量：简单显示
-            console.log(`\n✅ ${symbol} K线完成 | ${timeStr}`);
-            console.log(`💰 价格: ${klineData.open} → ${klineData.close} (${priceChange} ${priceChangePercent}%)`);
-            console.log(`📊 成交量: ${analysis.currentVolume.toFixed(0)} | 30根均值: ${analysis.averageVolume.toFixed(0)}`);
-            console.log(`📊 变化: ${analysis.percentageChange.toFixed(1)}% | 评级: ${analysis.volumeLevel}`);
-            if (analysis.consecutiveInfo.consecutiveCount > 0) {
-                console.log(`🔄 连续放量: ${analysis.consecutiveInfo.consecutiveCount}次 (需要≥2次才推送)`);
-            }
         }
         
-        console.log(`${'='.repeat(60)}`);
+        telegramMessage += `🔥 警报: ${symbol} 两根K线连续买入量异常放量！`;
+        telegramMessage += `\n📈 价格上升: +${twoKlineAnalysis.priceChange.percentage.toFixed(2)}%`;
+        
+        // 发送到Telegram
+        enqueueTelegramMessage(telegramMessage);
+    } else {
+        console.log(`   ⚠️  两根K线放量不足 (${twoKlineAnalysis.combined.totalPercentageChange.toFixed(1)}% < ${TRADING_CONFIG.MIN_VOLUME_INCREASE_PERCENT}%)`);
     }
+    // 注意：现在只处理两根K线都放量且综合放量大于200%的情况
+}
+
+// 新增：处理单根K线极端放量的函数
+async function handleSingleKlineExtremeVolume(symbol, klineData, analysis) {
+    const timeStr = new Date(klineData.closeTime).toLocaleString('zh-CN');
+    const priceChange = klineData.close > klineData.open ? '📈' : '📉';
+    const priceChangePercent = ((klineData.close - klineData.open) / klineData.open * 100).toFixed(2);
+    
+    // 控制台输出
+    console.log(`\n🚨 ====== ${symbol} 单根K线极端放量警报 ======`);
+    console.log(`⏰ K线时间: ${timeStr}`);
+    console.log(`📊 买入量: ${analysis.currentBuyVolume.toFixed(0)} | 30根均值: ${analysis.averageBuyVolume.toFixed(0)}`);
+    console.log(`📊 放量程度: +${analysis.percentageChange.toFixed(1)}% | 评级: ${analysis.buyVolumeLevel}`);
+    console.log(`💰 收盘价: ${klineData.close.toFixed(6)} | 价格变化: ${priceChange}${priceChangePercent}%`);
+    console.log(`📊 历史数据: ${analysis.historicalCount}根K线`);
+    
+    // 获取币种详细信息
+    const tokenDetails = await getCachedTokenDetails(symbol);
+    
+    if (tokenDetails) {
+        console.log(`\n📋 ${symbol} 币种信息:`);
+        console.log(`${'─'.repeat(50)}`);
+        
+        // 显示合约信息
+        if (tokenDetails.contractInfo) {
+            const onboardDate = new Date(tokenDetails.contractInfo.onboardDate).toLocaleString('zh-CN');
+            console.log(`📅 合约上线时间: ${onboardDate}`);
+            console.log(`📊 合约状态: ${tokenDetails.contractInfo.status}`);
+            console.log(`📋 合约类型: ${tokenDetails.contractInfo.contractType}`);
+        } else {
+            console.log(`❌ 合约信息获取失败`);
+        }
+        
+        // 显示持仓量信息
+        if (tokenDetails.openInterest) {
+            const oiTime = new Date(tokenDetails.openInterest.timestamp).toLocaleString('zh-CN');
+            const oiValue = (parseFloat(tokenDetails.openInterest.openInterestValue) / 1000000).toFixed(2);
+            console.log(`📈 当前持仓量: ${tokenDetails.openInterest.openInterest}`);
+            console.log(`💰 持仓总价值: ${oiValue}M USDT`);
+            console.log(`⏰ 数据时间: ${oiTime}`);
+        } else {
+            console.log(`❌ 持仓量信息获取失败`);
+        }
+        
+        console.log(`${'─'.repeat(50)}`);
+    } else {
+        console.log(`❌ 无法获取 ${symbol} 详细信息`);
+    }
+    
+    console.log(`🔥 警报: ${symbol} 单根K线买入量极端放量！`);
+    console.log(`📊 放量程度: +${analysis.percentageChange.toFixed(1)}% | 评级: ${analysis.buyVolumeLevel}`);
+    console.log(`==========================================`);
+    
+    // 构建Telegram消息
+    let telegramMessage = `🚨 ${symbol} 单根K线极端放量警报\n\n`;
+    telegramMessage += `⏰ K线时间: ${timeStr}\n`;
+    telegramMessage += `📊 买入量: ${analysis.currentBuyVolume.toFixed(0)} | 30根均值: ${analysis.averageBuyVolume.toFixed(0)}\n`;
+    telegramMessage += `📊 放量程度: +${analysis.percentageChange.toFixed(1)}% | 评级: ${analysis.buyVolumeLevel}\n`;
+    telegramMessage += `💰 收盘价: ${klineData.close.toFixed(6)} | 价格变化: ${priceChange}${priceChangePercent}%\n`;
+    telegramMessage += `📊 历史数据: ${analysis.historicalCount}根K线\n\n`;
+    
+    if (tokenDetails) {
+        telegramMessage += `📋 币种信息:\n`;
+        
+        if (tokenDetails.contractInfo) {
+            const onboardDate = new Date(tokenDetails.contractInfo.onboardDate).toLocaleString('zh-CN');
+            telegramMessage += `📅 合约上线: ${onboardDate}\n`;
+            telegramMessage += `📊 合约状态: ${tokenDetails.contractInfo.status}\n`;
+        }
+        
+        if (tokenDetails.openInterest) {
+            const oiValue = (parseFloat(tokenDetails.openInterest.openInterestValue) / 1000000).toFixed(2);
+            telegramMessage += `📈 当前持仓量: ${tokenDetails.openInterest.openInterest}\n`;
+            telegramMessage += `💰 持仓总价值: ${oiValue}M USDT\n`;
+        }
+        
+        telegramMessage += `\n`;
+    }
+    
+    telegramMessage += `🔥 警报: ${symbol} 单根K线买入量极端放量！`;
+    telegramMessage += `\n📊 放量程度: +${analysis.percentageChange.toFixed(1)}% | 评级: ${analysis.buyVolumeLevel}`;
+    
+    // 发送到Telegram
+    enqueueTelegramMessage(telegramMessage);
 }
 
 // 处理进行中的K线数据 (每30秒显示一次)
@@ -3032,462 +2348,136 @@ function handleOngoingKline(symbol, klineData) {
     }
     lastOngoingUpdate[symbol] = now;
 
-    const currentBuyVolume = parseFloat(klineData.buyVolume || 0);
-    const analysis = klineManager.analyzeVolume(currentBuyVolume);
+    const currentBuyVolume = parseFloat(klineData.buyVolume || klineData.volume);
+    const analysis = klineManager.analyzeBuyVolume(currentBuyVolume);
 
     if (analysis && analysis.historicalCount >= 5) {
         const timeStr = new Date(klineData.closeTime).toLocaleString('zh-CN');
         const priceChange = klineData.close > klineData.open ? '📈' : '📉';
         const priceChangePercent = ((klineData.close - klineData.open) / klineData.open * 100).toFixed(2);
 
-        // 获取买入量与历史均值的比较
-        const buyVolumeComparison = klineManager.compareBuyVolumeWithAverageVolume(currentBuyVolume);
-        
-        // 实时分析数据显示
-        console.log(`\n📊 ====== ${symbol} 实时分析 ======`);
-        console.log(`⏰ 时间: ${timeStr}`);
-        console.log(`💰 价格: ${klineData.open} → ${klineData.close} (${priceChange} ${priceChangePercent}%)`);
-        console.log(`📊 当前买入量: ${currentBuyVolume.toFixed(0)}`);
-        console.log(`📊 历史均值成交量: ${buyVolumeComparison.averageVolume.toFixed(0)}`);
-        console.log(`📊 差异: ${buyVolumeComparison.difference > 0 ? '+' : ''}${buyVolumeComparison.difference.toFixed(0)}`);
-        console.log(`📊 变化百分比: ${buyVolumeComparison.percentageChange > 0 ? '+' : ''}${buyVolumeComparison.percentageChange.toFixed(1)}%`);
-        console.log(`📊 比较结果: ${buyVolumeComparison.comparison}`);
-        console.log(`📊 分析说明: ${buyVolumeComparison.message}`);
-        console.log(`📊 历史K线数量: ${buyVolumeComparison.historicalCount}根`);
-        
-        // 显示历史成交量统计
-        if (buyVolumeComparison.details) {
-            console.log(`📊 历史最高成交量: ${buyVolumeComparison.details.maxVolume.toFixed(0)}`);
-            console.log(`📊 历史最低成交量: ${buyVolumeComparison.details.minVolume.toFixed(0)}`);
-            console.log(`📊 成交量标准差: ${buyVolumeComparison.details.volumeStdDev.toFixed(0)}`);
-        }
-        
-        // 显示趋势分析
-        if (analysis.volumeTrend) {
-            console.log(`📈 买入量趋势: ${analysis.volumeTrend.trend} (强度: ${analysis.volumeTrend.strength.toFixed(1)}%)`);
-        }
-        
-        console.log(`${'─'.repeat(50)}`);
+        console.log(`📊 ${symbol} 进行中 | ${timeStr} | 价格: ${klineData.close} (${priceChange}${priceChangePercent}%) | 买入量: ${analysis.buyVolumeLevel} (${analysis.percentageChange.toFixed(1)}%)`);
     }
 }
 
-// 交互式命令行界面
-
-
-// 批量加载币种从文件
-async function loadSymbolsFromFile(filePath) {
-    try {
-        // 检查文件是否存在
-        if (!fs.existsSync(filePath)) {
-            console.error(`❌ 文件不存在: ${filePath}`);
-            return [];
-        }
-        
-        const fileContent = fs.readFileSync(filePath, 'utf8');
-        let symbols = [];
-        
-        // 尝试解析为JSON格式
-        try {
-            const data = JSON.parse(fileContent);
-            if (Array.isArray(data)) {
-                symbols = data;
-            } else if (data.symbols && Array.isArray(data.symbols)) {
-                symbols = data.symbols;
-            } else if (data.filteredTradingPairs && Array.isArray(data.filteredTradingPairs)) {
-                symbols = data.filteredTradingPairs.map(item => item.tradingPair);
-            }
-        } catch (e) {
-            // 如果不是JSON，尝试解析为JavaScript数组格式
-            const match = fileContent.match(/const\s+\w+\s*=\s*\[([\s\S]*?)\];/);
-            if (match) {
-                const arrayContent = match[1];
-                symbols = arrayContent
-                    .split('\n')
-                    .map(line => line.trim())
-                    .filter(line => line.startsWith("'") && line.endsWith("',"))
-                    .map(line => line.slice(1, -2));
-            } else {
-                // 尝试按行分割
-                symbols = fileContent
-                    .split('\n')
-                    .map(line => line.trim())
-                    .filter(line => line.length > 0 && !line.startsWith('//'))
-                    .map(line => line.replace(/['"]/g, ''));
-            }
-        }
-        
-        console.log(`📁 从文件 ${filePath} 加载了 ${symbols.length} 个币种`);
-        return symbols;
-    } catch (error) {
-        console.error(`❌ 加载文件失败:`, error.message);
-        return [];
-    }
-}
-
-// 优化后的主函数
+// 主程序
 async function main() {
-    console.log('🚀 启动多币种K线监控系统...');
+    console.log('🚀 启动多币种K线买入量监控程序...\n');
     
+    // 尝试自动加载500个币种
+    let symbolsToMonitor = [];
+    
+    // 1. 尝试从low_market_cap_trading_pairs.js加载
     try {
-        // 检查是否有命令行参数
-        const args = process.argv.slice(2);
-        let symbolsToMonitor = [];
+        const fs = require('fs');
+        const path = require('path');
         
-        if (args.length > 0) {
-            const filePath = args[0];
-            console.log(`📁 从命令行参数加载币种文件: ${filePath}`);
-            symbolsToMonitor = await loadSymbolsFromFile(filePath);
-            
-            if (symbolsToMonitor.length === 0) {
-                console.log('⚠️ 未能从文件加载币种，使用默认币种列表');
-                symbolsToMonitor = CONFIG.defaultSymbols;
-            }
-        } else {
-            // 尝试自动加载最新的筛选结果
-            const possibleFiles = [
-                path.join(__dirname, 'low_market_cap_trading_pairs.js'),
-                path.join(__dirname, 'filtered_trading_pairs_by_market_cap.json'),
-                path.join(__dirname, 'trading_pairs.json')
-            ];
-            
-            for (const file of possibleFiles) {
-                if (fs.existsSync(file)) {
-                    console.log(`📁 自动发现币种文件: ${file}`);
-                    symbolsToMonitor = await loadSymbolsFromFile(file);
-                    if (symbolsToMonitor.length > 0) {
-                        console.log(`✅ 成功加载 ${symbolsToMonitor.length} 个币种`);
-                        break;
-                    }
-                }
-            }
-            
-            if (symbolsToMonitor.length === 0) {
-                console.log('⚠️ 未找到币种文件，使用默认币种列表');
-                symbolsToMonitor = CONFIG.defaultSymbols;
-            }
-        }
-        
-        // 限制最大监控数量，避免系统过载
-        const maxSymbols = 1000; // 最大监控1000个币种
-        if (symbolsToMonitor.length > maxSymbols) {
-            console.log(`⚠️ 币种数量过多 (${symbolsToMonitor.length})，限制为 ${maxSymbols} 个`);
-            symbolsToMonitor = symbolsToMonitor.slice(0, maxSymbols);
-        }
-        
-        console.log(`🎯 准备监控 ${symbolsToMonitor.length} 个币种`);
-        
-        // 使用新的批量添加功能
-        const startTime = Date.now();
-        const addedCount = await multiManager.addSymbols(symbolsToMonitor);
-        const endTime = Date.now();
-        const duration = ((endTime - startTime) / 1000).toFixed(1);
-        
-        console.log(`✅ 批量添加完成！成功添加 ${addedCount} 个币种，耗时 ${duration} 秒`);
-        
-        // 启动定期清理任务
-        setInterval(async () => {
-            try {
-                // 连接健康检查
-                const healthReport = await multiManager.checkConnectionHealth();
-                if (healthReport.brokenConnections > 0) {
-                    console.log(`⚠️ 检测到 ${healthReport.brokenConnections} 个断开的连接，已加入重连队列`);
-                }
-                
-                // 清理和优化
-                multiManager.cleanupInactiveConnections();
-                multiManager.optimizeMemory();
-                
-                // 检查是否需要恢复币种监控
-                const stats = multiManager.getStats();
-                if (stats.totalSymbols === 0) {
-                    console.log('⚠️ 检测到监控币种数量为0，尝试恢复币种监控...');
-                    await restoreSymbolMonitoring();
-                }
-                
-                // 显示详细统计信息
-                const status = multiManager.getConnectionStatus();
-                
-                console.log(`📊 系统状态报告:`);
-                console.log(`   📈 监控币种: ${stats.totalSymbols} 个`);
-                console.log(`   🔗 活跃连接: ${stats.activeConnections}/${stats.maxConnections} (${stats.connectionUtilization})`);
-                console.log(`   ⏳ 队列长度: ${stats.queuedConnections} 个`);
-                console.log(`   📊 连接成功率: ${stats.connectionSuccessRate}`);
-                console.log(`   📊 队列效率: ${stats.queueEfficiency}`);
-                console.log(`   💾 内存使用: ${stats.memoryUsageMB} MB`);
-                console.log(`   ❌ 失败连接: ${stats.failedConnections} 个`);
-                console.log(`   🔄 重试次数: ${stats.retryCount} 次`);
-                
-                // 性能警告
-                if (stats.memoryUsageMB > 500) {
-                    console.log(`⚠️ 内存使用较高 (${stats.memoryUsageMB}MB)，建议优化`);
-                }
-                
-                if (stats.connectionSuccessRate < 80) {
-                    console.log(`⚠️ 连接成功率较低 (${stats.connectionSuccessRate})，请检查网络`);
-                }
-                
-            } catch (error) {
-                console.error('❌ 定期任务执行失败:', error.message);
-            }
-        }, 5 * 60 * 1000); // 每5分钟执行一次
-        
-        // 启动Telegram消息队列处理
-        setInterval(() => {
-            if (telegramQueue.length > 0 && !isProcessingTelegramQueue) {
-                processTelegramQueue();
-            }
-        }, 10000); // 每10秒检查一次
-
-        // 启动连接恢复检查任务
-        setInterval(async () => {
-            try {
-                const stats = multiManager.getStats();
-                
-                // 如果监控币种数量为0，立即尝试恢复
-                if (stats.totalSymbols === 0) {
-                    console.log('🚨 检测到监控币种数量为0，立即尝试恢复...');
-                    await restoreSymbolMonitoring();
-                }
-                // 如果活跃连接比例过低，尝试重新连接
-                else if (stats.activeConnections > 0 && stats.connectionUtilization < 50) {
-                    console.log(`⚠️ 连接利用率较低 (${stats.connectionUtilization})，尝试优化连接...`);
-                    await multiManager.reconnectCleanedSymbols();
-                }
-                
-            } catch (error) {
-                console.error('❌ 连接恢复检查失败:', error.message);
-            }
-        }, 2 * 60 * 1000); // 每2分钟检查一次
-
-        // 启动实时状态显示任务
-        setInterval(() => {
-            try {
-                const stats = multiManager.getStats();
-                const now = new Date();
-                
-                // 显示实时状态
-                console.log(`\n📊 [${now.toLocaleTimeString('zh-CN')}] 实时状态:`);
-                console.log(`   📈 监控币种: ${stats.totalSymbols} 个`);
-                console.log(`   🔗 活跃连接: ${stats.activeConnections}/${stats.maxConnections}`);
-                console.log(`   ⏳ 队列长度: ${stats.queuedConnections} 个`);
-                console.log(`   💾 内存使用: ${stats.memoryUsageMB} MB`);
-                console.log(`   ✅ 成功连接: ${stats.successfulConnections || 0} 个`);
-                console.log(`   ❌ 失败连接: ${stats.failedConnections || 0} 个`);
-                console.log(`   📡 数据接收: ${stats.dataReceivedCount || 0} 条`);
-                if (stats.lastDataTime) {
-                    const timeSinceLastData = Date.now() - stats.lastDataTime;
-                    const minutesAgo = Math.floor(timeSinceLastData / 60000);
-                    console.log(`   ⏰ 最后数据: ${minutesAgo} 分钟前`);
-                }
-                
-                // 显示一些活跃币种的实时数据
-                if (stats.totalSymbols > 0) {
-                    const activeSymbols = Array.from(multiManager.symbols.keys()).slice(0, 5);
-                    console.log(`   🔥 活跃币种: ${activeSymbols.join(', ')}`);
-                    
-                    // 显示连接状态分布
-                    const connectionCounts = {
-                        open: 0,
-                        closed: 0,
-                        connecting: 0
-                    };
-                    
-                    for (const [symbol, ws] of multiManager.connections.entries()) {
-                        if (ws) {
-                            switch (ws.readyState) {
-                                case WebSocket.OPEN:
-                                    connectionCounts.open++;
-                                    break;
-                                case WebSocket.CLOSED:
-                                    connectionCounts.closed++;
-                                    break;
-                                case WebSocket.CONNECTING:
-                                    connectionCounts.connecting++;
-                                    break;
-                            }
-                        }
-                    }
-                    
-                    console.log(`   🔌 连接状态: 开放(${connectionCounts.open}) 关闭(${connectionCounts.closed}) 连接中(${connectionCounts.connecting})`);
-                }
-                
-                // 显示连接状态
-                const connectionStatus = multiManager.getConnectionStatus();
-                if (connectionStatus.brokenConnections > 0) {
-                    console.log(`   ⚠️ 断开连接: ${connectionStatus.brokenConnections} 个`);
-                }
-                
-                // 显示最近的活动
-                if (stats.totalSymbols > 0) {
-                    const recentActivity = [];
-                    for (const [symbol, klineManager] of multiManager.symbols.entries()) {
-                        if (klineManager.lastUpdateTime) {
-                            const timeSinceUpdate = Date.now() - klineManager.lastUpdateTime;
-                            if (timeSinceUpdate < 5 * 60 * 1000) { // 5分钟内有活动
-                                recentActivity.push(symbol);
-                            }
-                        }
-                    }
-                    if (recentActivity.length > 0) {
-                        console.log(`   📡 最近活动: ${recentActivity.slice(0, 3).join(', ')}${recentActivity.length > 3 ? '...' : ''}`);
-                    }
-                }
-                
-            } catch (error) {
-                console.error('❌ 实时状态显示失败:', error.message);
-            }
-        }, 30 * 1000); // 每30秒显示一次状态
-        
-        // 新增：启动买入量对比监控任务 - 每5分钟执行一次
-        setInterval(async () => {
-            try {
-                const now = new Date();
-                console.log(`\n🔍 [${now.toLocaleTimeString('zh-CN')}] 开始执行买入量对比分析...`);
-                
-                let totalAnalyzed = 0;
-                let abnormalCount = 0;
-                const abnormalSymbols = [];
-                
-                // 遍历所有监控的币种
-                for (const [symbol, klineManager] of multiManager.symbols.entries()) {
-                    if (!klineManager || !klineManager.isInitialized || klineManager.klines.length < 5) {
-                        continue; // 跳过未初始化或数据不足的币种
-                    }
-                    
-                    totalAnalyzed++;
-                    
-                    // 获取当前K线的买入量（如果有的话）
-                    let currentBuyVolume = 0;
-                    if (klineManager.klines.length > 0) {
-                        const latestKline = klineManager.klines[klineManager.klines.length - 1];
-                        currentBuyVolume = parseFloat(latestKline.buyVolume || latestKline.volume || 0);
-                    }
-                    
-                    // 如果当前买入量为0，跳过
-                    if (currentBuyVolume <= 0) {
-                        continue;
-                    }
-                    
-                    // 分析买入量与历史均值成交量的对比
-                    const comparison = klineManager.compareBuyVolumeWithAverageVolume(currentBuyVolume);
-                    
-                    if (comparison.percentageChange > 200) {
-                        abnormalCount++;
-                        abnormalSymbols.push({
-                            symbol: symbol,
-                            comparison: comparison
-                        });
-                        
-                        // 构建警报消息
-                        const alertMessage = `🚨 极端放量警报 - ${symbol}\n` +
-                            `⏰ 时间: ${now.toLocaleString('zh-CN')}\n` +
-                            `📊 当前买入量: ${comparison.currentBuyVolume.toFixed(0)}\n` +
-                            `📊 历史均值成交量: ${comparison.averageVolume.toFixed(0)}\n` +
-                            `📊 变化百分比: +${comparison.percentageChange.toFixed(1)}%\n` +
-                            `📊 分析结果: ${comparison.comparison}\n` +
-                            `📊 分析说明: ${comparison.message}\n` +
-                            `📊 历史K线数量: ${comparison.historicalCount}根`;
-                        
-                        // 命令行输出
-                        console.log(`\n${'='.repeat(80)}`);
-                        console.log(alertMessage);
-                        console.log(`${'='.repeat(80)}`);
-                        
-                        // 发送到Telegram
-                        enqueueTelegramMessage(alertMessage);
-                    }
-                }
-                
-                // 输出总结信息
-                console.log(`\n📊 买入量对比分析完成:`);
-                console.log(`   📈 分析币种数量: ${totalAnalyzed} 个`);
-                console.log(`   🚨 异常币种数量: ${abnormalCount} 个`);
-                
-                if (abnormalCount > 0) {
-                    console.log(`   🔥 异常币种列表:`);
-                    abnormalSymbols.forEach((item, index) => {
-                        console.log(`      ${index + 1}. ${item.symbol}: +${item.comparison.percentageChange.toFixed(1)}%`);
-                    });
-                } else {
-                    console.log(`   ✅ 所有币种买入量均在正常范围内`);
-                }
-                
-                console.log(`   ⏰ 下次分析时间: ${new Date(Date.now() + 5 * 60 * 1000).toLocaleTimeString('zh-CN')}`);
-                
-            } catch (error) {
-                console.error('❌ 买入量对比分析失败:', error.message);
-            }
-        }, 5 * 60 * 1000); // 每5分钟执行一次
-        
-        // 启动非交互式监控模式
-        console.log('🔄 系统已启动，正在后台监控中...');
-        console.log('💡 提示：程序将自动运行，无需人工干预');
-        
-    } catch (error) {
-        console.error('❌ 程序启动失败:', error.message);
-        console.error('错误详情:', error);
-        process.exit(1);
-    }
-}
-
-// 恢复币种监控的函数
-async function restoreSymbolMonitoring() {
-    try {
-        console.log('🔄 开始恢复币种监控...');
-        
-        // 尝试从文件重新加载币种
         const possibleFiles = [
-            path.join(__dirname, 'low_market_cap_trading_pairs.js'),
-            path.join(__dirname, 'filtered_trading_pairs_by_market_cap.json'),
-            path.join(__dirname, 'trading_pairs.json')
+            'low_market_cap_trading_pairs.js',
+            'filtered_trading_pairs_by_market_cap.json',
+            'trading_pairs.json'
         ];
         
-        let symbolsToRestore = [];
+        let foundFile = null;
         for (const file of possibleFiles) {
-            if (fs.existsSync(file)) {
-                console.log(`📁 尝试从文件恢复币种: ${file}`);
-                symbolsToRestore = await loadSymbolsFromFile(file);
-                if (symbolsToRestore.length > 0) {
-                    console.log(`✅ 成功从文件加载 ${symbolsToRestore.length} 个币种`);
-                    break;
-                }
+            const filePath = path.join(__dirname, file);
+            if (fs.existsSync(filePath)) {
+                foundFile = file;
+                console.log(`📁 自动发现币种文件: ${file}`);
+                break;
             }
         }
         
-        // 如果文件加载失败，使用默认币种列表
-        if (symbolsToRestore.length === 0) {
-            console.log('⚠️ 文件加载失败，使用默认币种列表恢复');
-            symbolsToRestore = CONFIG.defaultSymbols;
-        }
-        
-        // 限制恢复的币种数量
-        const maxSymbols = 500; // 恢复时限制数量，避免过载
-        if (symbolsToRestore.length > maxSymbols) {
-            console.log(`⚠️ 币种数量过多 (${symbolsToRestore.length})，限制为 ${maxSymbols} 个`);
-            symbolsToRestore = symbolsToRestore.slice(0, maxSymbols);
-        }
-        
-        // 重新添加币种到监控系统
-        console.log(`🔄 正在恢复 ${symbolsToRestore.length} 个币种的监控...`);
-        const addedCount = await multiManager.addSymbols(symbolsToRestore);
-        
-        if (addedCount > 0) {
-            console.log(`✅ 币种监控恢复成功！共恢复 ${addedCount} 个币种`);
+        if (foundFile) {
+            const filePath = path.join(__dirname, foundFile);
+            const fileContent = fs.readFileSync(filePath, 'utf8');
             
-            // 发送Telegram通知
-            const message = `🔄 币种监控已自动恢复\n📊 恢复币种数量: ${addedCount} 个\n⏰ 恢复时间: ${new Date().toLocaleString('zh-CN')}`;
-            enqueueTelegramMessage(message);
-        } else {
-            console.log('⚠️ 币种监控恢复失败');
+            if (foundFile.endsWith('.js')) {
+                // JavaScript数组格式
+                const match = fileContent.match(/const\s+\w+\s*=\s*\[([\s\S]*?)\];/);
+                if (match) {
+                    const arrayContent = match[1];
+                    symbolsToMonitor = arrayContent
+                        .split('\n')
+                        .map(line => line.trim())
+                        .filter(line => line.startsWith("'") && line.endsWith("',"))
+                        .map(line => line.slice(1, -2));
+                }
+            } else if (foundFile.endsWith('.json')) {
+                // JSON格式
+                try {
+                    const data = JSON.parse(fileContent);
+                    if (Array.isArray(data)) {
+                        symbolsToMonitor = data;
+                    } else if (data.symbols && Array.isArray(data.symbols)) {
+                        symbolsToMonitor = data.symbols;
+                    } else if (data.filteredTradingPairs && Array.isArray(data.filteredTradingPairs)) {
+                        symbolsToMonitor = data.filteredTradingPairs.map(item => item.tradingPair);
+                    }
+                } catch (e) {
+                    console.error('❌ JSON解析失败:', e.message);
+                }
+            }
+            
+            console.log(`✅ 成功加载 ${symbolsToMonitor.length} 个币种`);
         }
+    } catch (error) {
+        console.log(`⚠️ 自动加载币种文件失败: ${error.message}`);
+    }
+    
+    // 2. 如果没有找到文件，使用默认币种列表
+    if (symbolsToMonitor.length === 0) {
+        console.log('⚠️ 未能从文件加载币种，使用默认币种列表');
+        symbolsToMonitor = CONFIG.defaultSymbols;
+    }
+    
+    // 3. 显示币种信息
+    console.log(`🎯 准备监控 ${symbolsToMonitor.length} 个币种\n`);
+    
+    // 4. 使用批量添加机制
+    try {
+        const result = await multiManager.addSymbolsBatch(symbolsToMonitor);
+        
+        console.log(`\n🎉 币种添加完成！`);
+        console.log(`📊 系统状态: 监控${result.total}个币种 | 成功${result.successCount}个 | 失败${result.failCount}个`);
+        
+        // 显示系统状态
+        multiManager.showSystemStatus();
+        
+        // 启动定期状态显示
+        setInterval(() => {
+            multiManager.showSystemStatus();
+        }, 30000); // 每30秒显示一次状态
+        
+        // 启动定期清理任务
+        multiManager.startCleanupTask();
         
     } catch (error) {
-        console.error('❌ 恢复币种监控失败:', error.message);
+        console.error(`❌ 批量添加币种失败: ${error.message}`);
+        console.log('🔄 尝试使用传统方式添加默认币种...');
         
-        // 发送错误通知
-        const errorMessage = `❌ 币种监控恢复失败\n🔍 错误信息: ${error.message}\n⏰ 时间: ${new Date().toLocaleString('zh-CN')}`;
-        enqueueTelegramMessage(errorMessage);
+        // 回退到传统方式
+        for (const symbol of CONFIG.defaultSymbols.slice(0, 10)) { // 只添加前10个作为测试
+            console.log(`📊 正在添加默认监控币种 ${symbol}...`);
+            if (multiManager.addSymbol(symbol)) {
+                try {
+                    const success = await fetchHistoricalKlines(symbol);
+                    if (success) {
+                        connectWebSocketForSymbol(symbol);
+                        console.log(`✅ ${symbol} 监控启动成功！`);
+                    } else {
+                        console.log(`❌ ${symbol} 添加失败`);
+                    }
+                } catch (error) {
+                    console.log(`❌ ${symbol} 添加过程中出错: ${error.message}`);
+                }
+            }
+            console.log(''); // 添加空行分隔
+        }
     }
+    
+    console.log('\n📊 程序正在运行中，监控所有币种的买入量变化...');
+    console.log('💡 如需停止程序，请按 Ctrl+C\n');
 }
 
 // 程序退出处理
@@ -3502,11 +2492,3 @@ process.on('unhandledRejection', (reason, promise) => {
 
 // 启动程序
 main();
-
-// 导出类供测试使用
-module.exports = {
-    KlineManager,
-    MultiSymbolKlineManager,
-    Semaphore,
-    ConnectionRetryManager
-};

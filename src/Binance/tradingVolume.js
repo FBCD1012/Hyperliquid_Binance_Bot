@@ -6,8 +6,8 @@ const proxy = 'http://127.0.0.1:7897';
 const agent = new HttpsProxyAgent(proxy);
 
 // Telegram Bot 配置
-const TELEGRAM_BOT_TOKEN ='8319148120:AAEhkCBzjqc1Khs_BQ7ugNrjlF0Sus5RZTo';
-const TELEGRAM_CHAT_ID = '-1002642354005';
+const TELEGRAM_BOT_TOKEN ='';
+const TELEGRAM_CHAT_ID = '';
 
 // 交易策略配置
 const TRADING_CONFIG = {

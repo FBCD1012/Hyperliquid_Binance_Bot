@@ -1,0 +1,26 @@
+{
+  "name": "google-sheets-demo",
+  "version": "1.0.0",
+  "description": "Google Sheets API 演示程序",
+  "main": "googleSheetsDemo.js",
+  "scripts": {
+    "start": "node googleSheetsDemo.js",
+    "install-deps": "npm install",
+    "setup": "echo '请按照README.md中的说明设置Google Cloud凭据'"
+  },
+  "dependencies": {
+    "googleapis": "^128.0.0"
+  },
+  "devDependencies": {},
+  "keywords": [
+    "google-sheets",
+    "api",
+    "demo",
+    "trading-bot"
+  ],
+  "author": "Trading Bot Developer",
+  "license": "MIT",
+  "engines": {
+    "node": ">=16.0.0"
+  }
+}
